@@ -19,11 +19,13 @@ import click
 
 from .session import (
     SESSIONS_DIR,
+    clean_output,
     ensure_dirs,
     list_sessions,
     log_path,
     sock_path,
     state_path,
+    strip_ansi,
 )
 
 CONTEXT = {"help_option_names": ["-h", "--help"]}
@@ -62,7 +64,7 @@ def _resolve(name: str | None) -> dict:
             names = ", ".join(s["id"] for s in sessions)
             raise click.ClickException(f"several sessions live ({names}); pick one with -s")
         return sessions[0]
-    exact = [s for s in sessions if s["id"] == name]
+    exact = [s for s in sessions if name in (s["id"], s.get("name"))]
     if exact:
         return exact[0]
     partial = [s for s in sessions if s["id"].startswith(name)]
@@ -71,9 +73,13 @@ def _resolve(name: str | None) -> dict:
     raise click.ClickException(f"no single session matches {name!r}")
 
 
-def _session_id(user: str, host: str) -> str:
-    slug = "".join(c if c.isalnum() else "-" for c in f"{user}-{host}").strip("-")
-    return f"{slug}-{uuid.uuid4().hex[:6]}"
+def _slug(text: str) -> str:
+    return "".join(c if c.isalnum() else "-" for c in text).strip("-")
+
+
+def _session_id(name: str | None, user: str, host: str) -> str:
+    base = _slug(name) if name else _slug(f"{user}-{host}")
+    return f"{base}-{uuid.uuid4().hex[:6]}"
 
 
 def _rpc_or_fail(state: dict, op: str, wait: float | None = 15, **args) -> dict:
@@ -83,6 +89,22 @@ def _rpc_or_fail(state: dict, op: str, wait: float | None = 15, **args) -> dict:
     return response
 
 
+def _tail(path: Path, lines: int, raw: bool = False) -> str:
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        data = b""
+        while size > 0 and data.count(b"\n") <= lines:
+            step = min(8192, size)
+            size -= step
+            fh.seek(size)
+            data = fh.read(step) + data
+    text = clean_output(data.decode("utf-8", errors="replace"))
+    if not raw:
+        text = strip_ansi(text)
+    return "\n".join(text.splitlines()[-lines:]) + ("\n" if text else "")
+
+
 # ── CLI ──────────────────────────────────────────────────────────
 @click.group(context_settings=CONTEXT)
 @click.version_option(package_name="agent-pty")
@@ -90,7 +112,8 @@ def cli() -> None:
     """SSH into a machine with a full interactive PTY, held open in the background.
 
     Open a session once, then run commands, attach to the live shell, or move
-    files to and from it from separate invocations.
+    files to and from it from separate invocations. Commands run with exec
+    share the shell's state: cd, exports and functions persist.
     """
 
 
@@ -105,7 +128,18 @@ def cli() -> None:
     help="SSH password. Prompted when neither password nor key is given.",
 )
 @click.option("--ttl", default=30, show_default=True, type=int, help="Idle timeout in minutes.")
-def connect(host: str, port: int, user: str | None, key_file: str | None, password: str | None, ttl: int) -> None:
+@click.option("-n", "--name", default=None, help="Friendly session name.")
+@click.option("--insecure", is_flag=True, help="Do not verify or record host keys.")
+def connect(
+    host: str,
+    port: int,
+    user: str | None,
+    key_file: str | None,
+    password: str | None,
+    ttl: int,
+    name: str | None,
+    insecure: bool,
+) -> None:
     """Open a background session with an interactive PTY on HOST."""
     user = user or os.environ.get("USER") or "root"
     if not password and not key_file:
@@ -114,14 +148,16 @@ def connect(host: str, port: int, user: str | None, key_file: str | None, passwo
         password = click.prompt("SSH password", hide_input=True)
 
     ensure_dirs()
-    session_id = _session_id(user, host)
+    session_id = _session_id(name, user, host)
     config = {
         "id": session_id,
+        "name": name or session_id,
         "host": host,
         "port": port,
         "user": user,
         "password": password,
         "key_file": str(Path(key_file).expanduser()) if key_file else None,
+        "insecure": insecure,
         "ttl": ttl,
     }
     config_path = SESSIONS_DIR / f"{session_id}.cfg"
@@ -158,17 +194,22 @@ def connect(host: str, port: int, user: str | None, key_file: str | None, passwo
 
 
 @cli.command("sessions")
-def sessions_cmd() -> None:
+@click.option("--json", "as_json", is_flag=True, help="Print the session list as JSON.")
+def sessions_cmd(as_json: bool) -> None:
     """List live background sessions."""
     found = list_sessions(clean=True)
+    if as_json:
+        click.echo(json.dumps(found, indent=2))
+        return
     if not found:
         click.echo("no live sessions")
         return
-    rows = [("ID", "TARGET", "PID", "STARTED", "TTL")]
+    rows = [("ID", "NAME", "TARGET", "PID", "STARTED", "TTL")]
     for state in found:
         rows.append(
             (
                 state["id"],
+                state.get("name", "-"),
                 f"{state['user']}@{state['host']}:{state['port']}",
                 str(state["pid"]),
                 state.get("started_at", "?"),
@@ -181,25 +222,36 @@ def sessions_cmd() -> None:
 
 
 @cli.command("exec")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
 @click.option("--timeout", default=120.0, show_default=True, help="Seconds to wait for output.")
 @click.argument("command", nargs=-1, required=True)
 def exec_cmd(name: str | None, timeout: float, command: tuple[str, ...]) -> None:
-    """Run COMMAND on the session's connection and print its output.
+    """Run COMMAND in the live PTY shell. Shell state persists across calls.
 
-    The remote exit code becomes agent-pty's exit code.
+    The command's output is printed and its exit code becomes agent-pty's exit
+    code. On timeout the command is interrupted and agent-pty exits 124.
     """
     state = _resolve(name)
-    result = _rpc_or_fail(state, "exec", timeout + 30, command=" ".join(command), timeout=timeout)
-    if result.get("output"):
-        click.echo(result["output"], nl=not result["output"].endswith("\n"))
-    if result.get("stderr"):
-        click.echo(result["stderr"], err=True, nl=not result["stderr"].endswith("\n"))
+    result = _rpc(
+        Path(state["socket"]),
+        "exec",
+        timeout + 30,
+        command=" ".join(command),
+        timeout=timeout,
+    )
+    output = result.get("output") or ""
+    if output:
+        click.echo(output, nl=not output.endswith("\n"))
+    if not result.get("ok"):
+        if result.get("timed_out"):
+            click.echo(f"agent-pty: {result.get('error', 'timed out')}", err=True)
+            sys.exit(124)
+        raise click.ClickException(result.get("error", "request failed"))
     sys.exit(int(result.get("exit_code", 0)))
 
 
 @cli.command("shell")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
 def shell(name: str | None) -> None:
     """Attach to the live PTY. Press Ctrl-] to detach without closing it."""
     state = _resolve(name)
@@ -214,15 +266,21 @@ def shell(name: str | None) -> None:
     columns, rows = os.get_terminal_size()
     sock.sendall(json.dumps({"op": "attach", "args": {"cols": columns, "rows": rows}}).encode() + b"\n")
     if not json.loads(_recv_line(sock)).get("ok"):
-        raise click.ClickException("attach refused")
+        raise click.ClickException("attach refused: the session is running a command")
     sock.settimeout(None)
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setraw(fd)
+    last_size = (columns, rows)
     try:
         while True:
             ready, _, _ = select.select([sock, fd], [], [], 1.0)
+            with contextlib.suppress(OSError):
+                size = os.get_terminal_size()
+                if (size.columns, size.lines) != last_size:
+                    last_size = (size.columns, size.lines)
+                    _rpc(Path(state["socket"]), "resize", 2, cols=size.columns, rows=size.lines)
             if sock in ready:
                 data = sock.recv(65536)
                 if not data:
@@ -243,8 +301,37 @@ def shell(name: str | None) -> None:
     click.echo("\r\n[detached]")
 
 
+@cli.command("logs")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
+@click.option("-n", "--lines", default=40, show_default=True, help="Lines to show.")
+@click.option("-f", "--follow", is_flag=True, help="Keep printing new output.")
+@click.option("--raw", is_flag=True, help="Keep terminal escape sequences.")
+def logs_cmd(name: str | None, lines: int, follow: bool, raw: bool) -> None:
+    """Show the PTY transcript of a session."""
+    state = _resolve(name)
+    path = Path(state.get("transcript") or "")
+    if not path.is_file():
+        raise click.ClickException("this session has no transcript yet")
+    click.echo(_tail(path, lines, raw), nl=False)
+    if not follow:
+        return
+    position = path.stat().st_size
+    try:
+        while True:
+            with path.open("rb") as fh:
+                fh.seek(position)
+                chunk = fh.read()
+            if chunk:
+                text = clean_output(chunk.decode("utf-8", errors="replace"))
+                click.echo(text if raw else strip_ansi(text), nl=False)
+                position += len(chunk)
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        return
+
+
 @cli.command("upload")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
 @click.argument("local")
 @click.argument("remote", required=False)
 def upload(name: str | None, local: str, remote: str | None) -> None:
@@ -255,7 +342,7 @@ def upload(name: str | None, local: str, remote: str | None) -> None:
 
 
 @cli.command("upload-dir")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
 @click.argument("local")
 @click.argument("remote", required=False)
 def upload_dir(name: str | None, local: str, remote: str | None) -> None:
@@ -266,7 +353,7 @@ def upload_dir(name: str | None, local: str, remote: str | None) -> None:
 
 
 @cli.command("download")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
 @click.argument("remote")
 @click.argument("local", required=False)
 def download(name: str | None, remote: str, local: str | None) -> None:
@@ -277,7 +364,7 @@ def download(name: str | None, remote: str, local: str | None) -> None:
 
 
 @cli.command("download-dir")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
 @click.argument("remote")
 @click.argument("local", required=False)
 def download_dir(name: str | None, remote: str, local: str | None) -> None:
@@ -288,7 +375,7 @@ def download_dir(name: str | None, remote: str, local: str | None) -> None:
 
 
 @cli.command("close")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
 @click.option("--all", "close_all", is_flag=True, help="Close every live session.")
 def close(name: str | None, close_all: bool) -> None:
     """Close a session and its SSH connection."""
@@ -302,12 +389,16 @@ def close(name: str | None, close_all: bool) -> None:
 
 
 @cli.command("info")
-@click.option("-s", "--session", "name", default=None, help="Session id or unique prefix.")
-def info_cmd(name: str | None) -> None:
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
+@click.option("--json", "as_json", is_flag=True, help="Print the state as JSON.")
+def info_cmd(name: str | None, as_json: bool) -> None:
     """Show one session's state."""
     state = _resolve(name)
     result = _rpc_or_fail(state, "info", 10)
-    for key in ("id", "host", "port", "user", "idle_seconds", "ttl", "attached"):
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    for key in ("id", "name", "host", "port", "user", "idle_seconds", "ttl", "attached", "running", "transcript"):
         click.echo(f"{key}: {result.get(key)}")
 
 

@@ -6,11 +6,13 @@ import contextlib
 import json
 import os
 import posixpath
+import re
 import socket
 import stat
 import sys
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,7 +21,12 @@ import paramiko
 HOME = Path(os.environ.get("AGENT_PTY_HOME", str(Path.home() / ".agent-pty")))
 SESSIONS_DIR = HOME / "sessions"
 AUDIT_LOG = HOME / "audit.jsonl"
+KNOWN_HOSTS = HOME / "known_hosts"
+BUFFER_LIMIT = 1_048_576
 _audit_lock = threading.Lock()
+
+_MARK_B = "\x1eAPTY{n}B\x1e"
+_MARK_E = "\x1eAPTY{n}E"
 
 
 # ── paths, state, audit ──────────────────────────────────────────
@@ -28,8 +35,10 @@ def ensure_dirs() -> None:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     for path in (HOME, SESSIONS_DIR):
         os.chmod(path, 0o700)
-    with contextlib.suppress(OSError):
-        os.chmod(AUDIT_LOG, 0o600)
+    for path in (AUDIT_LOG, KNOWN_HOSTS):
+        with contextlib.suppress(OSError):
+            path.touch(exist_ok=True)
+            os.chmod(path, 0o600)
 
 
 def state_path(session_id: str) -> Path:
@@ -42,6 +51,10 @@ def sock_path(session_id: str) -> Path:
 
 def log_path(session_id: str) -> Path:
     return SESSIONS_DIR / f"{session_id}.log"
+
+
+def transcript_path(session_id: str) -> Path:
+    return SESSIONS_DIR / f"{session_id}.out"
 
 
 def audit(session_id: str, action: str, **fields) -> None:
@@ -87,7 +100,66 @@ def list_sessions(clean: bool = False) -> list[dict]:
 
 
 # ── exec framing ─────────────────────────────────────────────────
-def _remote_path(sftp: paramiko.SFTPClient, path: str) -> str:
+def pty_payload(command: str, nonce: str) -> str:
+    """One compound command whose markers bracket only the command's output.
+
+    Prompts, PS2, echoed input and pre/post-command hooks all print outside the
+    markers, so the captured slice is the command output alone.
+    """
+    return (
+        f"{{ printf '\\036APTY{nonce}B\\036'\n"
+        f"{command}\n"
+        "__apty_rc=$?\n"
+        f"printf '\\036APTY{nonce}E%s\\036' \"$__apty_rc\"\n"
+        "}\n"
+    )
+
+
+def parse_exec(buf: str, nonce: str) -> tuple[str, int] | None:
+    """Output and exit code between the markers, or None if not finished."""
+    begin = _MARK_B.format(n=nonce)
+    start = buf.rfind(begin)
+    if start < 0:
+        return None
+    end = re.search(re.escape(_MARK_E.format(n=nonce)) + r"(\d+)\x1e", buf[start:])
+    if not end:
+        return None
+    return buf[start + len(begin) : start + end.start()], int(end.group(1))
+
+
+def parse_partial(buf: str, nonce: str) -> str:
+    """Whatever the command printed before an interrupted exec."""
+    begin = _MARK_B.format(n=nonce)
+    start = buf.rfind(begin)
+    if start < 0:
+        return ""
+    body = buf[start + len(begin) :]
+    for stop in ("\x03", "^C"):
+        index = body.find(stop)
+        if index >= 0:
+            return body[:index]
+    return body
+
+
+def clean_output(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+_ANSI = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences
+    r"|\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI sequences
+    r"|\x1b[@-Z\\-_]"  # other escapes
+)
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def strip_ansi(text: str) -> str:
+    """Drop terminal escapes and control bytes, keeping newlines and tabs."""
+    return _CONTROL.sub("", _ANSI.sub("", text))
+
+
+# ── file transfer helpers ────────────────────────────────────────
+def remote_path(sftp: paramiko.SFTPClient, path: str) -> str:
     """Expand a leading ~ against the remote home, which sftp does not do."""
     if path == "~" or path.startswith("~/"):
         home = sftp.normalize(".")
@@ -125,27 +197,30 @@ class SessionServer:
 
     def __init__(self, config: dict) -> None:
         self.id: str = config["id"]
+        self.name: str = config.get("name") or self.id
         self.host: str = config["host"]
         self.port: int = int(config["port"])
         self.user: str = config["user"]
         self.password: str | None = config.get("password")
         self.key_file: str | None = config.get("key_file")
+        self.insecure: bool = bool(config.get("insecure"))
         self.ttl_seconds: int = int(config["ttl"]) * 60
 
         self._lock = threading.Lock()
         self._exec_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._stop = threading.Event()
+        self._buf = bytearray()
         self._attached: socket.socket | None = None
         self._last_activity = time.time()
         self._client: paramiko.SSHClient | None = None
         self._chan: paramiko.Channel | None = None
+        self._transcript = None
 
     # -- lifecycle
     def start(self) -> None:
         ensure_dirs()
-        self._client = paramiko.SSHClient()
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self._client = self._build_client()
         self._client.connect(
             hostname=self.host,
             port=self.port,
@@ -156,6 +231,11 @@ class SessionServer:
             allow_agent=False,
             look_for_keys=False,
         )
+        if not self.insecure:
+            with contextlib.suppress(OSError):
+                self._client.save_host_keys(str(KNOWN_HOSTS))
+                os.chmod(KNOWN_HOSTS, 0o600)
+
         transport = self._client.get_transport()
         if transport is None:
             raise RuntimeError("SSH transport unavailable")
@@ -165,12 +245,25 @@ class SessionServer:
         channel.get_pty(term=os.environ.get("TERM", "xterm-256color"), width=cols, height=rows)
         channel.invoke_shell()
         self._chan = channel
+        self._transcript = transcript_path(self.id).open("ab")  # noqa: SIM115 - lives with the daemon
+        os.chmod(transcript_path(self.id), 0o600)
 
         self._write_state()
-        audit(self.id, "connect", host=self.host, user=self.user, port=self.port)
+        audit(self.id, "connect", host=self.host, user=self.user, port=self.port, name=self.name)
 
         threading.Thread(target=self._reader, name="pty-reader", daemon=True).start()
         threading.Thread(target=self._ttl_guard, name="ttl", daemon=True).start()
+
+    def _build_client(self) -> paramiko.SSHClient:
+        client = paramiko.SSHClient()
+        if not self.insecure:
+            with contextlib.suppress(OSError):
+                client.load_system_host_keys()
+            if KNOWN_HOSTS.exists():
+                with contextlib.suppress(OSError):
+                    client.load_host_keys(str(KNOWN_HOSTS))
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # noqa: S507 - TOFU, stored in KNOWN_HOSTS
+        return client
 
     def serve(self) -> None:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -193,12 +286,13 @@ class SessionServer:
         if not self._close_lock.acquire(blocking=False):
             return
         self._stop.set()
-        for closer in (self._chan, self._client):
+        for closer in (self._chan, self._client, self._transcript):
             if closer is not None:
                 with contextlib.suppress(Exception):
                     closer.close()
         self._chan = None
         self._client = None
+        self._transcript = None
         audit(self.id, "close")
         sock_path(self.id).unlink(missing_ok=True)
         state_path(self.id).unlink(missing_ok=True)
@@ -206,6 +300,7 @@ class SessionServer:
     def _write_state(self) -> None:
         state = {
             "id": self.id,
+            "name": self.name,
             "host": self.host,
             "port": self.port,
             "user": self.user,
@@ -213,6 +308,7 @@ class SessionServer:
             "socket": str(sock_path(self.id)),
             "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "ttl": self.ttl_seconds // 60,
+            "transcript": str(transcript_path(self.id)),
         }
         tmp = state_path(self.id).with_suffix(".tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
@@ -243,7 +339,14 @@ class SessionServer:
                 if not data:
                     break
                 with self._lock:
+                    self._buf.extend(data)
+                    if len(self._buf) > BUFFER_LIMIT:
+                        del self._buf[: len(self._buf) - BUFFER_LIMIT]
                     attached = self._attached
+                if self._transcript is not None:
+                    with contextlib.suppress(OSError):
+                        self._transcript.write(data)
+                        self._transcript.flush()
                 if attached is not None:
                     try:
                         attached.sendall(data)
@@ -261,46 +364,56 @@ class SessionServer:
 
     # -- operations
     def exec(self, command: str, timeout: float = 120) -> dict:
-        """Run one command on the session's connection, captured cleanly."""
-        if self._client is None or self._stop.is_set():
+        """Run one command inside the live PTY shell, keeping its state."""
+        chan = self._chan
+        if chan is None or self._stop.is_set():
             return {"ok": False, "error": "session is closed"}
         if not self._exec_lock.acquire(blocking=False):
-            return {"ok": False, "error": "another command is running"}
-        channel = None
+            return {"ok": False, "error": "session is attached to a terminal"}
+        nonce = uuid.uuid4().hex[:8]
         try:
-            transport = self._client.get_transport()
-            if transport is None:
-                return {"ok": False, "error": "connection lost"}
-            channel = transport.open_session()
-            channel.exec_command(command)
-            stdout, stderr = bytearray(), bytearray()
+            with self._lock:
+                if self._attached is not None:
+                    return {"ok": False, "error": "session is attached to a terminal"}
+                self._buf.clear()
+            chan.sendall(pty_payload(command, nonce))
             deadline = time.time() + timeout
-            while time.time() < deadline:
+            while time.time() < deadline and not self._stop.is_set():
                 self._touch()
-                while channel.recv_ready():
-                    stdout.extend(channel.recv(65536))
-                while channel.recv_stderr_ready():
-                    stderr.extend(channel.recv_stderr(65536))
-                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                parsed = parse_exec(self._buffer_text(), nonce)
+                if parsed is not None:
+                    output, code = parsed
+                    audit(self.id, "exec", command=command[:200], exit_code=code)
+                    return {"ok": True, "output": clean_output(output), "exit_code": code}
+                time.sleep(0.03)
+            with contextlib.suppress(Exception):
+                chan.sendall(b"\x03")
+            for _ in range(40):
+                parsed = parse_exec(self._buffer_text(), nonce)
+                if parsed is not None:
                     break
-                time.sleep(0.02)
-            else:
-                audit(self.id, "exec", command=command[:200], timed_out=True)
-                return {"ok": False, "error": f"command timed out after {timeout}s", "timed_out": True}
-            code = channel.recv_exit_status()
-            audit(self.id, "exec", command=command[:200], exit_code=code)
+                time.sleep(0.05)
+            partial = clean_output(parse_partial(self._buffer_text(), nonce))
+            audit(self.id, "exec", command=command[:200], exit_code=124, timed_out=True)
             return {
-                "ok": True,
-                "output": stdout.decode("utf-8", errors="replace"),
-                "stderr": stderr.decode("utf-8", errors="replace"),
-                "exit_code": code,
+                "ok": False,
+                "error": f"command timed out after {timeout}s",
+                "output": partial,
+                "exit_code": 124,
+                "timed_out": True,
             }
-        except (OSError, paramiko.SSHException) as exc:
-            return {"ok": False, "error": str(exc)}
         finally:
-            if channel is not None:
-                channel.close()
             self._exec_lock.release()
+
+    def _buffer_text(self) -> str:
+        with self._lock:
+            return self._buf.decode("utf-8", errors="replace")
+
+    def resize(self, cols: int, rows: int) -> dict:
+        if self._chan is None:
+            return {"ok": False, "error": "session is closed"}
+        self._chan.resize_pty(width=cols, height=rows)
+        return {"ok": True}
 
     def upload(self, local: str, remote: str | None, directory: bool) -> dict:
         sftp = self._sftp()
@@ -310,7 +423,7 @@ class SessionServer:
             source = os.path.abspath(local)
             if not os.path.exists(source):
                 return {"ok": False, "error": f"no such path: {local}"}
-            target = _remote_path(sftp, remote) if remote else posixpath.basename(source.rstrip(os.sep))
+            target = remote_path(sftp, remote) if remote else posixpath.basename(source.rstrip(os.sep))
             if directory:
                 files = _put_tree(sftp, source, target)
             else:
@@ -330,11 +443,13 @@ class SessionServer:
         if sftp is None:
             return {"ok": False, "error": "sftp unavailable"}
         try:
+            remote = remote_path(sftp, remote)
             target = local or posixpath.basename(remote.rstrip("/"))
-            remote = _remote_path(sftp, remote)
             if directory:
                 files = _get_tree(sftp, remote, target)
             else:
+                if target.endswith(("/", os.sep)):
+                    os.makedirs(target, exist_ok=True)
                 if os.path.isdir(target):
                     target = os.path.join(target, posixpath.basename(remote))
                 os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
@@ -354,12 +469,15 @@ class SessionServer:
         return {
             "ok": True,
             "id": self.id,
+            "name": self.name,
             "host": self.host,
             "port": self.port,
             "user": self.user,
             "idle_seconds": idle,
             "ttl": self.ttl_seconds // 60,
             "attached": attached,
+            "running": self._exec_lock.locked(),
+            "transcript": str(transcript_path(self.id)),
         }
 
     def _sftp(self) -> paramiko.SFTPClient | None:
@@ -388,11 +506,12 @@ class SessionServer:
                 response = self.upload(args["local"], args.get("remote"), bool(args.get("dir")))
             elif op == "download":
                 response = self.download(args["remote"], args.get("local"), bool(args.get("dir")))
+            elif op == "resize":
+                response = self.resize(int(args.get("cols", 0)), int(args.get("rows", 0)))
             elif op == "info":
                 response = self.info()
             elif op == "close":
-                response = {"ok": True}
-                conn.sendall(json.dumps(response).encode() + b"\n")
+                conn.sendall(b'{"ok": true}\n')
                 self.shutdown()
                 return
             else:
@@ -410,34 +529,39 @@ class SessionServer:
         if chan is None:
             conn.sendall(b'{"ok": false, "error": "session is closed"}\n')
             return
-        with self._exec_lock:
+        if not self._exec_lock.acquire(blocking=False):
+            conn.sendall(b'{"ok": false, "error": "session is busy running a command"}\n')
+            with contextlib.suppress(Exception):
+                conn.close()
+            return
+        try:
             with self._lock:
                 self._attached = conn
             conn.sendall(b'{"ok": true}\n')
-            rows = int(args.get("rows") or 0)
             cols = int(args.get("cols") or 0)
+            rows = int(args.get("rows") or 0)
             if rows and cols:
                 chan.resize_pty(width=cols, height=rows)
             self._touch()
-            try:
-                while not self._stop.is_set():
-                    data = conn.recv(65536)
-                    if not data:
-                        break
-                    if b"\x1d" in data:  # Ctrl-] detaches
-                        data = data.split(b"\x1d", 1)[0]
-                        if data:
-                            chan.sendall(data)
-                        break
-                    chan.sendall(data)
-                    self._touch()
-            except OSError:
-                pass
-            finally:
-                self._detach()
-                audit(self.id, "detach")
-        with contextlib.suppress(Exception):
-            conn.close()
+            while not self._stop.is_set():
+                data = conn.recv(65536)
+                if not data:
+                    break
+                if b"\x1d" in data:  # Ctrl-] detaches
+                    data = data.split(b"\x1d", 1)[0]
+                    if data:
+                        chan.sendall(data)
+                    break
+                chan.sendall(data)
+                self._touch()
+        except OSError:
+            pass
+        finally:
+            self._detach()
+            audit(self.id, "detach")
+            self._exec_lock.release()
+            with contextlib.suppress(Exception):
+                conn.close()
 
 
 # ── daemon entry point ───────────────────────────────────────────

@@ -1,7 +1,7 @@
 """agent-pty: SSH with persistent, background PTY sessions."""
 
 from .main import main
-from .session import list_sessions
+from .session import list_sessions, parse_exec
 
-__all__ = ["list_sessions", "main"]
-__version__ = "0.2.0"
+__all__ = ["list_sessions", "main", "parse_exec"]
+__version__ = "0.3.0"
