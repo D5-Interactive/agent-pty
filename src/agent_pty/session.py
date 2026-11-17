@@ -7,6 +7,7 @@ import json
 import os
 import posixpath
 import re
+import select
 import socket
 import stat
 import sys
@@ -80,7 +81,7 @@ def pid_alive(pid: int) -> bool:
 def read_state(session_id: str) -> dict | None:
     try:
         return json.loads(state_path(session_id).read_text(encoding="utf-8"))
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return None
 
 
@@ -99,7 +100,21 @@ def list_sessions(clean: bool = False) -> list[dict]:
     return sorted(sessions, key=lambda s: s.get("started_at", ""))
 
 
-# ── exec framing ─────────────────────────────────────────────────
+# ── ssh config and exec framing ──────────────────────────────────
+def ssh_config(host: str) -> dict:
+    """Resolve HOST through ~/.ssh/config, empty when there is none."""
+    path = Path.home() / ".ssh" / "config"
+    if not path.is_file():
+        return {}
+    config = paramiko.SSHConfig()
+    try:
+        with path.open(encoding="utf-8") as fh:
+            config.parse(fh)
+        return dict(config.lookup(host))
+    except OSError:
+        return {}
+
+
 def pty_payload(command: str, nonce: str) -> str:
     """One compound command whose markers bracket only the command's output.
 
@@ -153,9 +168,51 @@ _ANSI = re.compile(
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
+_MARK_TEXT = re.compile(r"\\036APTY[0-9a-f]{8}[BZE]\\036|APTY[0-9a-f]{8}[BZE]")
+
+
 def strip_ansi(text: str) -> str:
-    """Drop terminal escapes and control bytes, keeping newlines and tabs."""
-    return _CONTROL.sub("", _ANSI.sub("", text))
+    """Drop terminal escapes, control bytes and agent-pty framing markers."""
+    return _MARK_TEXT.sub("", _CONTROL.sub("", _ANSI.sub("", text)))
+
+
+# ── forwarding spec ──────────────────────────────────────────────
+def parse_forward(spec: str) -> tuple[str, int, str, int]:
+    """Parse [bind:]port:host:port into (bind, listen_port, host, target_port)."""
+    parts = spec.split(":")
+    try:
+        if len(parts) == 3:
+            bind, listen_port, host, target_port = "127.0.0.1", int(parts[0]), parts[1], int(parts[2])
+        elif len(parts) == 4:
+            bind, listen_port, host, target_port = parts[0] or "127.0.0.1", int(parts[1]), parts[2], int(parts[3])
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(f"bad forward spec: {spec}") from exc
+    return bind, listen_port, host, target_port
+
+
+def _pump(left, right) -> None:
+    """Shuttle bytes both ways until either side closes."""
+    try:
+        while True:
+            ready, _, _ = select.select([left, right], [], [], 1.0)
+            if left in ready:
+                data = left.recv(65536)
+                if not data:
+                    break
+                right.sendall(data)
+            if right in ready:
+                data = right.recv(65536)
+                if not data:
+                    break
+                left.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for channel in (left, right):
+            with contextlib.suppress(Exception):
+                channel.close()
 
 
 # ── file transfer helpers ────────────────────────────────────────
@@ -199,14 +256,14 @@ class SessionServer:
         self.id: str = config["id"]
         self.name: str = config.get("name") or self.id
         self.host: str = config["host"]
-        self.port: int = int(config["port"])
-        self.user: str = config["user"]
+        self.port: int | None = config.get("port")
+        self.user: str | None = config.get("user")
         self.password: str | None = config.get("password")
         self.key_file: str | None = config.get("key_file")
         self.insecure: bool = bool(config.get("insecure"))
         self.ttl_seconds: int = int(config["ttl"]) * 60
 
-        self._lock = threading.Lock()
+        self._cond = threading.Condition()
         self._exec_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._stop = threading.Event()
@@ -216,13 +273,25 @@ class SessionServer:
         self._client: paramiko.SSHClient | None = None
         self._chan: paramiko.Channel | None = None
         self._transcript = None
+        self._interrupt = threading.Event()
+        self._forwards: list[dict] = []
+        self._forward_seq = 0
 
     # -- lifecycle
     def start(self) -> None:
         ensure_dirs()
+        settings = ssh_config(self.host)
+        hostname = str(settings.get("hostname") or self.host)
+        self.user = self.user or settings.get("user") or os.environ.get("USER") or "root"
+        self.port = self.port or int(settings.get("port") or 22)
+        if not self.key_file and not self.password:
+            keys = settings.get("identityfile") or []
+            if keys:
+                self.key_file = os.path.expanduser(keys[0])
+
         self._client = self._build_client()
         self._client.connect(
-            hostname=self.host,
+            hostname=hostname,
             port=self.port,
             username=self.user,
             password=self.password,
@@ -286,6 +355,10 @@ class SessionServer:
         if not self._close_lock.acquire(blocking=False):
             return
         self._stop.set()
+        for entry in self._forwards:
+            with contextlib.suppress(Exception):
+                entry["closer"]()
+        self._forwards.clear()
         for closer in (self._chan, self._client, self._transcript):
             if closer is not None:
                 with contextlib.suppress(Exception):
@@ -316,12 +389,12 @@ class SessionServer:
         tmp.replace(state_path(self.id))
 
     def _touch(self) -> None:
-        with self._lock:
+        with self._cond:
             self._last_activity = time.time()
 
     def _ttl_guard(self) -> None:
         while not self._stop.wait(5):
-            with self._lock:
+            with self._cond:
                 idle = time.time() - self._last_activity
             if idle > self.ttl_seconds:
                 audit(self.id, "idle_timeout", idle_seconds=int(idle))
@@ -334,32 +407,43 @@ class SessionServer:
         if chan is None:
             return
         while not self._stop.is_set():
-            if chan.recv_ready():
-                data = chan.recv(65536)
-                if not data:
-                    break
-                with self._lock:
-                    self._buf.extend(data)
-                    if len(self._buf) > BUFFER_LIMIT:
-                        del self._buf[: len(self._buf) - BUFFER_LIMIT]
-                    attached = self._attached
-                if self._transcript is not None:
-                    with contextlib.suppress(OSError):
-                        self._transcript.write(data)
-                        self._transcript.flush()
-                if attached is not None:
-                    try:
-                        attached.sendall(data)
-                    except OSError:
-                        self._detach()
-            elif chan.closed:
+            try:
+                ready = chan.recv_ready()
+            except (OSError, EOFError):
                 break
-            else:
-                time.sleep(0.02)
+            if not ready:
+                try:
+                    select.select([chan], [], [], 0.2)
+                except (OSError, ValueError):
+                    break
+                if chan.closed:
+                    break
+                continue
+            try:
+                data = chan.recv(65536)
+            except (OSError, EOFError):
+                break
+            if not data:
+                break
+            with self._cond:
+                self._buf.extend(data)
+                if len(self._buf) > BUFFER_LIMIT:
+                    del self._buf[: len(self._buf) - BUFFER_LIMIT]
+                attached = self._attached
+                self._cond.notify_all()
+            if self._transcript is not None:
+                with contextlib.suppress(OSError):
+                    self._transcript.write(data)
+                    self._transcript.flush()
+            if attached is not None:
+                try:
+                    attached.sendall(data)
+                except OSError:
+                    self._detach()
         self._stop.set()
 
     def _detach(self) -> None:
-        with self._lock:
+        with self._cond:
             self._attached = None
 
     # -- operations
@@ -371,43 +455,97 @@ class SessionServer:
         if not self._exec_lock.acquire(blocking=False):
             return {"ok": False, "error": "session is attached to a terminal"}
         nonce = uuid.uuid4().hex[:8]
+        self._interrupt.clear()
         try:
-            with self._lock:
+            with self._cond:
                 if self._attached is not None:
                     return {"ok": False, "error": "session is attached to a terminal"}
+                self._buf.clear()
+            # Quiet the line discipline first so the typed payload is never echoed.
+            chan.sendall(f"stty -echo; printf '\\036APTY{nonce}Z\\036'\n".encode())
+            quiet_deadline = time.time() + 3
+            while time.time() < quiet_deadline:
+                if f"\x1eAPTY{nonce}Z\x1e" in self._buffer_text():
+                    break
+                time.sleep(0.02)
+            with self._cond:
                 self._buf.clear()
             chan.sendall(pty_payload(command, nonce))
             deadline = time.time() + timeout
             while time.time() < deadline and not self._stop.is_set():
                 self._touch()
-                parsed = parse_exec(self._buffer_text(), nonce)
+                with self._cond:
+                    parsed = parse_exec(self._buf.decode("utf-8", errors="replace"), nonce)
+                    if parsed is None and not self._interrupt.is_set():
+                        self._cond.wait(0.05)
                 if parsed is not None:
                     output, code = parsed
                     audit(self.id, "exec", command=command[:200], exit_code=code)
                     return {"ok": True, "output": clean_output(output), "exit_code": code}
-                time.sleep(0.03)
-            with contextlib.suppress(Exception):
-                chan.sendall(b"\x03")
-            for _ in range(40):
+                if self._interrupt.is_set():
+                    break
+            interrupted = self._interrupt.is_set()
+            if not interrupted:
+                with contextlib.suppress(Exception):
+                    chan.sendall(b"\x03")
+            for _ in range(10):
                 parsed = parse_exec(self._buffer_text(), nonce)
                 if parsed is not None:
                     break
-                time.sleep(0.05)
+                with self._cond:
+                    self._cond.wait(0.05)
             partial = clean_output(parse_partial(self._buffer_text(), nonce))
-            audit(self.id, "exec", command=command[:200], exit_code=124, timed_out=True)
+            code = 130 if interrupted else 124
+            audit(self.id, "exec", command=command[:200], exit_code=code, interrupted=interrupted)
             return {
                 "ok": False,
-                "error": f"command timed out after {timeout}s",
+                "error": "interrupted" if interrupted else f"command timed out after {timeout}s",
                 "output": partial,
-                "exit_code": 124,
-                "timed_out": True,
+                "exit_code": code,
+                "interrupted": interrupted,
+                "timed_out": not interrupted,
             }
         finally:
+            with contextlib.suppress(Exception):
+                chan.sendall(b"stty echo\n")
             self._exec_lock.release()
 
     def _buffer_text(self) -> str:
-        with self._lock:
+        with self._cond:
             return self._buf.decode("utf-8", errors="replace")
+
+    def write(self, data: str) -> dict:
+        """Send raw input to the PTY shell."""
+        chan = self._chan
+        if chan is None or self._stop.is_set():
+            return {"ok": False, "error": "session is closed"}
+        if not self._exec_lock.acquire(blocking=False):
+            return {"ok": False, "error": "session is busy"}
+        try:
+            chan.sendall(data.encode())
+            self._touch()
+            audit(self.id, "write", bytes=len(data))
+            return {"ok": True}
+        except (OSError, paramiko.SSHException) as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._exec_lock.release()
+
+    def interrupt(self) -> dict:
+        chan = self._chan
+        if chan is None:
+            return {"ok": False, "error": "session is closed"}
+        self._interrupt.set()
+        chan.sendall(b"\x03")
+        self._touch()
+        audit(self.id, "interrupt")
+        return {"ok": True}
+
+    def rename(self, name: str) -> dict:
+        self.name = name
+        self._write_state()
+        audit(self.id, "rename", name=name)
+        return {"ok": True, "name": name}
 
     def resize(self, cols: int, rows: int) -> dict:
         if self._chan is None:
@@ -415,6 +553,103 @@ class SessionServer:
         self._chan.resize_pty(width=cols, height=rows)
         return {"ok": True}
 
+    # -- forwarding
+    def add_forward(self, direction: str, spec: str) -> dict:
+        if self._client is None or self._stop.is_set():
+            return {"ok": False, "error": "session is closed"}
+        try:
+            bind, listen_port, host, target_port = parse_forward(spec)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        if direction == "local":
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                listener.bind((bind, listen_port))
+                listener.listen(16)
+            except OSError as exc:
+                listener.close()
+                return {"ok": False, "error": str(exc)}
+            listen_port = listener.getsockname()[1]
+            threading.Thread(target=self._accept_local, args=(listener, host, target_port), daemon=True).start()
+            closer = listener.close
+        elif direction == "remote":
+            transport = self._client.get_transport()
+            if transport is None:
+                return {"ok": False, "error": "connection lost"}
+
+            def handler(chan, _origin, _server, host=host, port=target_port):
+                threading.Thread(target=self._remote_conn, args=(chan, host, port), daemon=True).start()
+
+            try:
+                transport.request_port_forward(bind, listen_port, handler)
+            except (OSError, paramiko.SSHException) as exc:
+                return {"ok": False, "error": str(exc)}
+            closer = lambda: transport.cancel_port_forward(bind, listen_port)  # noqa: E731
+        else:
+            return {"ok": False, "error": f"unknown direction: {direction}"}
+
+        with self._cond:
+            self._forward_seq += 1
+            forward_id = self._forward_seq
+        entry = {
+            "id": forward_id,
+            "direction": direction,
+            "listen": f"{bind}:{listen_port}",
+            "target": f"{host}:{target_port}",
+            "closer": closer,
+        }
+        self._forwards.append(entry)
+        audit(self.id, "forward", direction=direction, listen=entry["listen"], target=entry["target"])
+        return {"ok": True, **{k: entry[k] for k in ("id", "direction", "listen", "target")}}
+
+    def _accept_local(self, listener: socket.socket, host: str, port: int) -> None:
+        listener.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._local_conn, args=(conn, host, port), daemon=True).start()
+
+    def _local_conn(self, conn: socket.socket, host: str, port: int) -> None:
+        transport = self._client.get_transport() if self._client else None
+        if transport is None:
+            conn.close()
+            return
+        try:
+            peer = conn.getpeername()
+            channel = transport.open_channel("direct-tcpip", (host, port), peer)
+        except (OSError, paramiko.SSHException):
+            conn.close()
+            return
+        _pump(conn, channel)
+
+    def _remote_conn(self, channel, host: str, port: int) -> None:
+        try:
+            conn = socket.create_connection((host, port), timeout=10)
+        except OSError:
+            channel.close()
+            return
+        _pump(channel, conn)
+
+    def remove_forward(self, forward_id: int) -> dict:
+        for entry in list(self._forwards):
+            if entry["id"] == forward_id:
+                with contextlib.suppress(Exception):
+                    entry["closer"]()
+                self._forwards.remove(entry)
+                audit(self.id, "unforward", id=forward_id)
+                return {"ok": True}
+        return {"ok": False, "error": f"no forward {forward_id}"}
+
+    def forwards(self) -> list[dict]:
+        return [{k: entry[k] for k in ("id", "direction", "listen", "target")} for entry in self._forwards]
+
+    # -- file transfer
     def upload(self, local: str, remote: str | None, directory: bool) -> dict:
         sftp = self._sftp()
         if sftp is None:
@@ -463,7 +698,7 @@ class SessionServer:
             sftp.close()
 
     def info(self) -> dict:
-        with self._lock:
+        with self._cond:
             idle = int(time.time() - self._last_activity)
             attached = self._attached is not None
         return {
@@ -478,6 +713,7 @@ class SessionServer:
             "attached": attached,
             "running": self._exec_lock.locked(),
             "transcript": str(transcript_path(self.id)),
+            "forwards": self.forwards(),
         }
 
     def _sftp(self) -> paramiko.SFTPClient | None:
@@ -502,12 +738,22 @@ class SessionServer:
                 return
             if op == "exec":
                 response = self.exec(args.get("command", ""), float(args.get("timeout", 120)))
+            elif op == "write":
+                response = self.write(args.get("data", ""))
+            elif op == "interrupt":
+                response = self.interrupt()
+            elif op == "rename":
+                response = self.rename(args.get("name", ""))
+            elif op == "resize":
+                response = self.resize(int(args.get("cols", 0)), int(args.get("rows", 0)))
+            elif op == "forward":
+                response = self.add_forward(args.get("direction", "local"), args.get("spec", ""))
+            elif op == "unforward":
+                response = self.remove_forward(int(args.get("id", 0)))
             elif op == "upload":
                 response = self.upload(args["local"], args.get("remote"), bool(args.get("dir")))
             elif op == "download":
                 response = self.download(args["remote"], args.get("local"), bool(args.get("dir")))
-            elif op == "resize":
-                response = self.resize(int(args.get("cols", 0)), int(args.get("rows", 0)))
             elif op == "info":
                 response = self.info()
             elif op == "close":
@@ -535,7 +781,7 @@ class SessionServer:
                 conn.close()
             return
         try:
-            with self._lock:
+            with self._cond:
                 self._attached = conn
             conn.sendall(b'{"ok": true}\n')
             cols = int(args.get("cols") or 0)

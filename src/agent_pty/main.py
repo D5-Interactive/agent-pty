@@ -77,8 +77,8 @@ def _slug(text: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in text).strip("-")
 
 
-def _session_id(name: str | None, user: str, host: str) -> str:
-    base = _slug(name) if name else _slug(f"{user}-{host}")
+def _session_id(name: str | None, user: str | None, host: str) -> str:
+    base = _slug(name) if name else _slug(f"{user or 'ssh'}-{host}")
     return f"{base}-{uuid.uuid4().hex[:6]}"
 
 
@@ -119,8 +119,8 @@ def cli() -> None:
 
 @cli.command("connect")
 @click.argument("host")
-@click.option("-p", "--port", default=22, show_default=True, help="SSH port.")
-@click.option("-u", "--user", default=None, help="Remote username.")
+@click.option("-p", "--port", default=None, type=int, help="SSH port. Default 22 or ~/.ssh/config.")
+@click.option("-u", "--user", default=None, help="Remote username. Default from ~/.ssh/config or $USER.")
 @click.option("-i", "--key-file", default=None, help="SSH private key file.")
 @click.option(
     "--password",
@@ -140,8 +140,11 @@ def connect(
     name: str | None,
     insecure: bool,
 ) -> None:
-    """Open a background session with an interactive PTY on HOST."""
-    user = user or os.environ.get("USER") or "root"
+    """Open a background session with an interactive PTY on HOST.
+
+    HOST is resolved through ~/.ssh/config when it has an entry, so aliases,
+    IdentityFile, User and Port work without extra flags.
+    """
     if not password and not key_file:
         if not sys.stdin.isatty():
             raise click.ClickException("provide --password or --key-file")
@@ -181,7 +184,8 @@ def connect(
         if sock_path(session_id).exists():
             probe = _rpc(sock_path(session_id), "info", 2)
             if probe.get("ok"):
-                click.echo(f"{session_id}\t{user}@{host}:{port}\tttl {ttl}m")
+                target = f"{probe.get('user')}@{host}:{probe.get('port')}"
+                click.echo(f"{session_id}\t{target}\tttl {ttl}m")
                 return
         time.sleep(0.1)
 
@@ -204,14 +208,17 @@ def sessions_cmd(as_json: bool) -> None:
     if not found:
         click.echo("no live sessions")
         return
-    rows = [("ID", "NAME", "TARGET", "PID", "STARTED", "TTL")]
+    rows = [("ID", "NAME", "TARGET", "PID", "IDLE", "STARTED", "TTL")]
     for state in found:
+        probe = _rpc(Path(state["socket"]), "info", 1)
+        idle = f"{probe['idle_seconds']}s" if probe.get("ok") else "-"
         rows.append(
             (
                 state["id"],
                 state.get("name", "-"),
                 f"{state['user']}@{state['host']}:{state['port']}",
                 str(state["pid"]),
+                idle,
                 state.get("started_at", "?"),
                 f"{state.get('ttl', '?')}m",
             )
@@ -243,9 +250,9 @@ def exec_cmd(name: str | None, timeout: float, command: tuple[str, ...]) -> None
     if output:
         click.echo(output, nl=not output.endswith("\n"))
     if not result.get("ok"):
-        if result.get("timed_out"):
-            click.echo(f"agent-pty: {result.get('error', 'timed out')}", err=True)
-            sys.exit(124)
+        if result.get("timed_out") or result.get("interrupted"):
+            click.echo(f"agent-pty: {result.get('error', 'interrupted')}", err=True)
+            sys.exit(int(result.get("exit_code", 124)))
         raise click.ClickException(result.get("error", "request failed"))
     sys.exit(int(result.get("exit_code", 0)))
 
@@ -400,6 +407,86 @@ def info_cmd(name: str | None, as_json: bool) -> None:
         return
     for key in ("id", "name", "host", "port", "user", "idle_seconds", "ttl", "attached", "running", "transcript"):
         click.echo(f"{key}: {result.get(key)}")
+    for entry in result.get("forwards") or []:
+        click.echo(f"forward {entry['id']}: -{entry['direction'][0].upper()} {entry['listen']} -> {entry['target']}")
+
+
+@cli.command("send")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
+@click.option("--no-newline", is_flag=True, help="Send the text without a trailing newline.")
+@click.argument("text")
+def send_cmd(name: str | None, no_newline: bool, text: str) -> None:
+    """Type TEXT into the live PTY shell."""
+    state = _resolve(name)
+    _rpc_or_fail(state, "write", 10, data=text if no_newline else text + "\n")
+    click.echo("sent")
+
+
+@cli.command("interrupt")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
+def interrupt_cmd(name: str | None) -> None:
+    """Send Ctrl-C to the live PTY shell."""
+    state = _resolve(name)
+    _rpc_or_fail(state, "interrupt", 10)
+    click.echo("interrupted")
+
+
+@cli.command("rename")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
+@click.argument("new_name")
+def rename_cmd(name: str | None, new_name: str) -> None:
+    """Give a session a new name."""
+    state = _resolve(name)
+    result = _rpc_or_fail(state, "rename", 10, name=new_name)
+    click.echo(f"renamed {state['id']} -> {result['name']}")
+
+
+@cli.command("forward")
+@click.option("-s", "--session", "name", default=None, help="Session id, name, or unique prefix.")
+@click.option(
+    "-L",
+    "--local",
+    "local_forwards",
+    multiple=True,
+    metavar="[BIND:]PORT:HOST:PORT",
+    help="Listen locally and forward to the remote side.",
+)
+@click.option(
+    "-R",
+    "--remote",
+    "remote_forwards",
+    multiple=True,
+    metavar="[BIND:]PORT:HOST:PORT",
+    help="Listen on the remote side and forward to the local side.",
+)
+@click.option("--list", "list_forwards", is_flag=True, help="Show active forwards.")
+@click.option("--remove", "remove_id", default=None, type=int, help="Remove a forward by id.")
+def forward_cmd(
+    name: str | None,
+    local_forwards: tuple[str, ...],
+    remote_forwards: tuple[str, ...],
+    list_forwards: bool,
+    remove_id: int | None,
+) -> None:
+    """Add, list, or remove SSH port forwards on a live session."""
+    state = _resolve(name)
+    if list_forwards:
+        info = _rpc_or_fail(state, "info", 10)
+        for entry in info.get("forwards") or []:
+            click.echo(f"{entry['id']}\t-{entry['direction'][0].upper()}\t{entry['listen']}\t{entry['target']}")
+        if not info.get("forwards"):
+            click.echo("no forwards")
+        return
+    if remove_id is not None:
+        _rpc_or_fail(state, "unforward", 10, id=remove_id)
+        click.echo(f"removed forward {remove_id}")
+        return
+    for direction, specs in (("local", local_forwards), ("remote", remote_forwards)):
+        for spec in specs:
+            result = _rpc_or_fail(state, "forward", 20, direction=direction, spec=spec)
+            click.echo(f"{result['id']}\t-{direction[0].upper()}\t{result['listen']}\t{result['target']}")
+    if not local_forwards and not remote_forwards:
+        raise click.ClickException("pass -L, -R, --list, or --remove")
 
 
 def main() -> None:

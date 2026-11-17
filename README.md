@@ -2,10 +2,10 @@
 
 Persistent SSH sessions with a full interactive PTY, held open in the background.
 
-Open a session once. Then run commands, attach to the live shell, or move files
-from separate terminal invocations. Commands share one shell, so `cd`, exports
-and functions persist between them. The session survives until you close it or
-its idle TTL expires.
+Open a session once. Then run commands, attach to the live shell, forward ports,
+or move files from separate terminal invocations. Commands share one shell, so
+`cd`, exports and functions persist between them. The session survives until you
+close it or its idle TTL expires.
 
 ## Install
 
@@ -14,17 +14,20 @@ uv tool install --from . agent-pty   # local checkout
 uv sync && uv run agent-pty --help   # development
 ```
 
+Python 3.11 or newer.
+
 ## Quick start
 
 ```bash
-# 1. open a background session (password, key, or interactive prompt)
-agent-pty connect d5dog -u deploy --key-file ~/.ssh/id_ed25519 --name web --ttl 30
+# 1. open a background session. HOST resolves through ~/.ssh/config
+agent-pty connect web --name web --ttl 30
 
 # 2. use it from anywhere
 agent-pty exec -s web 'cd /srv/app && git pull'
 agent-pty exec -s web 'pwd'                   # /srv/app, state kept
 agent-pty shell  -s web                       # full PTY, Ctrl-] detaches
 agent-pty logs   -s web -n 50                 # PTY transcript
+agent-pty forward -s web -L 8080:localhost:80 # local tunnel to the remote port
 agent-pty upload ./build.tar.gz '~/releases/'
 agent-pty sessions
 agent-pty close  -s web
@@ -38,11 +41,15 @@ when exactly one session is live.
 | Command | Purpose |
 | --- | --- |
 | `connect HOST` | Open a background session with an interactive PTY. |
-| `sessions` | List live sessions: id, name, target, pid, start, TTL. |
-| `info` | Show one session: host, user, idle, TTL, attached, running, transcript path. |
+| `sessions` | List live sessions: id, name, target, pid, idle, start, TTL. |
+| `info` | Show one session: host, user, idle, TTL, attached, running, forwards, transcript. |
 | `exec CMD...` | Run a command inside the live PTY shell. State persists across calls. |
 | `shell` | Attach to the live PTY. `Ctrl-]` detaches without closing the session. |
+| `send TEXT` | Type text into the live PTY shell. |
+| `interrupt` | Send Ctrl-C, and stop a running `exec` with exit code 130. |
 | `logs` | Print the session transcript, with `-f` to follow it. |
+| `rename NEWNAME` | Give the session a new name. |
+| `forward` | Add, list, or remove SSH port forwards. |
 | `upload FILE [REMOTE]` | Upload one file. A trailing `/` on REMOTE means that directory. |
 | `upload-dir DIR [REMOTE]` | Upload a directory tree. |
 | `download FILE [LOCAL]` | Download one file. A trailing `/` on LOCAL means that directory. |
@@ -53,26 +60,46 @@ when exactly one session is live.
 
 | Flag | Commands | Meaning |
 | --- | --- | --- |
-| `-p, --port` | `connect` | SSH port, default 22. |
-| `-u, --user` | `connect` | Remote user, defaults to `$USER`. |
-| `-i, --key-file` | `connect` | Private key file. Any key type paramiko supports. |
+| `-p, --port` | `connect` | SSH port. Default 22 or `~/.ssh/config`. |
+| `-u, --user` | `connect` | Remote user. Default from `~/.ssh/config`, `$USER`, or `root`. |
+| `-i, --key-file` | `connect` | Private key file. Default from `~/.ssh/config` IdentityFile. |
 | `--password` | `connect` | SSH password. Prompted when neither password nor key is given. |
 | `--ttl` | `connect` | Idle timeout in minutes, default 30. |
 | `-n, --name` | `connect` | Friendly session name, usable with `-s`. |
 | `--insecure` | `connect` | Do not verify or record host keys. |
-| `-s, --session` | all but `connect`, `sessions` | Session id, name, or unique id prefix. |
+| `-s, --session` | most commands | Session id, name, or unique id prefix. |
 | `--timeout` | `exec` | Seconds to wait, default 120. On expiry the command is interrupted and agent-pty exits 124. |
+| `--no-newline` | `send` | Type the text without a trailing newline. |
 | `-n, --lines` | `logs` | Lines to print, default 40. |
 | `-f, --follow` | `logs` | Keep printing new output until Ctrl-C. |
 | `--raw` | `logs` | Keep terminal escape sequences. |
+| `-L, --local` | `forward` | `[BIND:]PORT:HOST:PORT`, listen locally. Repeatable. |
+| `-R, --remote` | `forward` | `[BIND:]PORT:HOST:PORT`, listen on the remote side. Repeatable. |
+| `--list` | `forward` | Show active forwards. |
+| `--remove ID` | `forward` | Remove a forward by id. |
 | `--json` | `sessions`, `info` | Machine-readable output. |
 | `--all` | `close` | Close every live session. |
 | `-h, --help` | anywhere | Full help, including every subcommand and flag. |
+
+## Port forwarding
+
+```bash
+agent-pty forward -s web -L 8080:localhost:80      # local 8080 -> web's port 80
+agent-pty forward -s web -L 15432:db:5432          # local 15432 -> web -> db:5432
+agent-pty forward -s web -R 9000:localhost:3000    # web's 9000 -> your 3000
+agent-pty forward -s web --list
+agent-pty forward -s web --remove 1
+```
+
+For `-L`, `HOST:PORT` is resolved on the remote side. For `-R`, it is resolved
+on your side. Both default to binding `127.0.0.1`.
 
 ## Behavior
 
 - One daemon process per session, under `~/.agent-pty/sessions/` (mode 0700).
   The daemon dies with its session.
+- `HOST` resolves through `~/.ssh/config` for HostName, User, Port and the first
+  IdentityFile.
 - `exec` sends one compound command to the interactive shell and brackets it
   with control-byte markers, so prompts, echoed input and shell hooks stay out
   of the captured output. Since a PTY merges streams, stderr appears with
@@ -87,16 +114,17 @@ when exactly one session is live.
 - The full PTY stream is appended to `~/.agent-pty/sessions/<id>.out` and read
   by `logs`.
 - Every operation is appended to `~/.agent-pty/audit.jsonl`: timestamp,
-  session id, action, command, exit code, transfer paths. Passwords are never
-  written there.
+  session id, action, command, exit code, transfer paths, forwards. Passwords
+  are never written there.
+- The idle TTL closes abandoned sessions and their forwards.
 - Remote `~` is expanded for `upload` and `download` targets.
 
 ## Layout
 
 ```
 src/agent_pty/main.py      CLI and client transport
-src/agent_pty/session.py   SSH session, PTY pump, exec framing, transfer, daemon
-tests/test_cli.py          help surface, exec framing, transcript cleaning
+src/agent_pty/session.py   SSH session, PTY pump, exec framing, forwarding, daemon
+tests/test_cli.py          help surface, exec framing, forwards, transcript cleaning
 ```
 
 ## Development

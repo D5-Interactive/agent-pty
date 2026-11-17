@@ -4,7 +4,7 @@ import pytest
 from click.testing import CliRunner
 
 from agent_pty.main import _session_id, cli
-from agent_pty.session import clean_output, parse_exec, parse_partial, pty_payload, strip_ansi
+from agent_pty.session import clean_output, parse_exec, parse_forward, parse_partial, pty_payload, strip_ansi
 
 COMMANDS = [
     "connect",
@@ -12,6 +12,10 @@ COMMANDS = [
     "exec",
     "shell",
     "logs",
+    "send",
+    "interrupt",
+    "rename",
+    "forward",
     "upload",
     "upload-dir",
     "download",
@@ -36,6 +40,10 @@ def test_help_lists_every_command():
         ("exec", ["--session", "--timeout", "COMMAND"]),
         ("shell", ["--session"]),
         ("logs", ["--session", "--lines", "--follow", "--raw"]),
+        ("send", ["--session", "--no-newline", "TEXT"]),
+        ("interrupt", ["--session"]),
+        ("rename", ["--session", "NEW_NAME"]),
+        ("forward", ["--session", "--local", "--remote", "--list", "--remove"]),
         ("upload", ["--session", "LOCAL", "REMOTE"]),
         ("upload-dir", ["--session", "LOCAL", "REMOTE"]),
         ("download", ["--session", "REMOTE", "LOCAL"]),
@@ -102,6 +110,24 @@ def test_clean_output_normalizes_carriage_returns():
 def test_strip_ansi_removes_escapes_and_control_bytes():
     raw = "\x1b]2;title\x07\x1b[34mhello\x1b[00m\x00world\x1b[K"
     assert strip_ansi(raw) == "helloworld"
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("8080:localhost:80", ("127.0.0.1", 8080, "localhost", 80)),
+        ("10.1.2.3:9000:db:5432", ("10.1.2.3", 9000, "db", 5432)),
+        ("2222:host:22", ("127.0.0.1", 2222, "host", 22)),
+    ],
+)
+def test_parse_forward(spec, expected):
+    assert parse_forward(spec) == expected
+
+
+@pytest.mark.parametrize("spec", ["8080", "a:b:c:d:e", "x:y:z"])
+def test_parse_forward_rejects_bad_specs(spec):
+    with pytest.raises(ValueError, match="bad forward spec"):
+        parse_forward(spec)
 
 
 def test_session_id_is_socket_safe():
