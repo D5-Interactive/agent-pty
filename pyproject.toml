@@ -1,11 +1,9 @@
 [project]
 name = "agent-pty"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "SSH with persistent background PTY sessions, file transfer, and audit logging"
 readme = "README.md"
-authors = [
-    { name = "dsient", email = "dsient@users.noreply.github.com" }
-]
+authors = [{ name = "dsient", email = "dsient@users.noreply.github.com" }]
 requires-python = ">=3.14"
 dependencies = [
     "click>=8.5.1",
@@ -15,6 +13,19 @@ dependencies = [
 [project.scripts]
 agent-pty = "agent_pty:main"
 
+[dependency-groups]
+dev = ["build>=1.6.1", "pytest>=8.0", "ruff>=0.17"]
+
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "BLE", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S106"]
