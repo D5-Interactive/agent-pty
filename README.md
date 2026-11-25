@@ -1,5 +1,7 @@
 # agent-pty
 
+[![PyPI](https://img.shields.io/pypi/v/agent-pty)](https://pypi.org/project/agent-pty/)
+
 Persistent SSH sessions with a full interactive PTY, held open in the background.
 
 Open a session once. Then run commands, attach to the live shell, forward ports,
@@ -14,6 +16,8 @@ uv tool install agent-pty            # from PyPI
 uv tool install --from . agent-pty   # local checkout
 uv sync && uv run agent-pty --help   # development
 ```
+
+Package page: https://pypi.org/project/agent-pty/
 
 Python 3.11 or newer.
 
@@ -45,7 +49,7 @@ when exactly one session is live.
 | --- | --- |
 | `connect HOST` | Open a background session with an interactive PTY. |
 | `sessions` | List live sessions: id, name, target, pid, idle, start, TTL. |
-| `info` | Show one session: host, user, idle, TTL, attached, running, forwards, transcript. |
+| `info` | Show one session: host, user, shell, idle, uptime, TTL, connected, running, forwards, transcript. |
 | `exec CMD...` | Run a command inside the live PTY shell. State persists across calls. |
 | `shell` | Attach to the live PTY. `Ctrl-]` detaches without closing the session. |
 | `send TEXT` | Type text into the live PTY shell. |
@@ -155,6 +159,7 @@ curl --socks5-hostname 127.0.0.1:1080 http://internal.service/
 - `sessions --json` adds live fields: idle, uptime, attached, running and
   forwards. `logs -f` stops when the session ends.
 - `exec` framing expects a POSIX shell (bash, zsh or sh).
+- `info` reports the detected shell and the size of the captured reconnect state.
 
 ## Layout
 
@@ -163,6 +168,12 @@ src/agent_pty/main.py      CLI and client transport
 src/agent_pty/session.py   SSH session, PTY pump, exec framing, forwarding, daemon
 tests/test_cli.py          help surface, exec framing, forwards, transcript cleaning
 ```
+
+## Releases
+
+Publishing a GitHub release runs the Publish workflow, which builds the wheel and
+sdist and uploads them to PyPI with the `PYPI_TOKEN` repository secret. A manual
+run is available from the Actions tab.
 
 ## Development
 
