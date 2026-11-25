@@ -139,6 +139,16 @@ def cli() -> None:
 @click.option(
     "--keepalive", default=30, show_default=True, type=int, help="SSH keepalive interval in seconds, 0 to disable."
 )
+@click.option(
+    "-J", "--jump", "jumps", multiple=True, metavar="[USER@]HOST[:PORT]", help="Jump host, repeatable for a chain."
+)
+@click.option(
+    "--jump-password", default=None, help="Password for jump hosts. They otherwise use ssh config keys or the agent."
+)
+@click.option("--forward-agent", is_flag=True, help="Forward the local ssh-agent to the remote side.")
+@click.option(
+    "--reconnect", default=0, show_default=True, type=int, help="Reconnect attempts after a dropped connection."
+)
 def connect(
     host: str,
     port: int,
@@ -151,6 +161,10 @@ def connect(
     agent: bool,
     connect_timeout: int,
     keepalive: int,
+    jumps: tuple[str, ...],
+    jump_password: str | None,
+    forward_agent: bool,
+    reconnect: int,
 ) -> None:
     """Open a background session with an interactive PTY on HOST.
 
@@ -176,6 +190,10 @@ def connect(
         "agent": agent,
         "connect_timeout": connect_timeout,
         "keepalive": keepalive,
+        "jump": list(jumps),
+        "jump_password": jump_password,
+        "forward_agent": forward_agent,
+        "reconnect": reconnect,
         "ttl": ttl,
     }
     config_path = SESSIONS_DIR / f"{session_id}.cfg"
@@ -185,7 +203,12 @@ def connect(
     with log_path(session_id).open("ab") as log:
         os.chmod(log_path(session_id), 0o600)
         proc = subprocess.Popen(  # noqa: S603
-            [sys.executable, "-m", "agent_pty.session", str(config_path)],
+            [
+                sys.executable,
+                "-c",
+                "import sys; from agent_pty.session import serve; serve(sys.argv[1])",
+                str(config_path),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -444,6 +467,10 @@ def info_cmd(name: str | None, as_json: bool) -> None:
         "started_at",
         "ttl",
         "attached",
+        "connected",
+        "reconnect",
+        "jumps",
+        "forward_agent",
         "running",
         "transcript",
     )

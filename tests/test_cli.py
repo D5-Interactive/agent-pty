@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 import sys
 
 import pytest
@@ -11,9 +12,11 @@ from agent_pty import session as session_module
 from agent_pty.main import _resolve, _session_id, cli
 from agent_pty.session import (
     clean_output,
+    parse_cwd,
     parse_dynamic,
     parse_exec,
     parse_forward,
+    parse_jump,
     parse_partial,
     prune_artifacts,
     pty_payload,
@@ -81,6 +84,14 @@ def test_pty_payload_brackets_the_command_in_one_group():
     assert payload.rstrip().endswith("}")
     assert payload.count("\\036APTYabc12345B\\036") == 1
     assert payload.count("\\036APTYabc12345E%s\\036") == 1
+    assert "APTYabc12345C%s" in payload and '"$PWD"' in payload
+
+
+def test_parse_cwd_reads_the_directory_marker():
+    nonce = "abc12345"
+    buf = f"\x1eAPTY{nonce}E0\x1e\x1eAPTY{nonce}C/srv/app\x1e"
+    assert parse_cwd(buf, nonce) == "/srv/app"
+    assert parse_cwd("nothing", nonce) is None
 
 
 def test_parse_exec_ignores_prompt_and_echo():
@@ -184,12 +195,39 @@ def test_prune_keeps_live_sessions_and_drops_dead_ones(monkeypatch, tmp_path):
         (tmp_path / f"{session_id}.json").write_text(json.dumps({"id": session_id, "pid": pid}))
         for suffix in ("sock", "out", "log"):
             (tmp_path / f"{session_id}.{suffix}").write_text("x")
+    orphan = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    orphan.bind(str(tmp_path / "dead-2.sock"))
     removed = prune_artifacts()
+    orphan.close()
     assert not (tmp_path / "dead-1.json").exists()
     assert not (tmp_path / "dead-1.out").exists()
+    assert not (tmp_path / "dead-2.sock").exists()
     assert (tmp_path / "live-1.json").exists()
     assert (tmp_path / "live-1.out").exists()
-    assert removed == 4
+    assert removed == 5
+
+
+def test_parse_forward_and_dynamic_accept_ipv6():
+    assert parse_forward("[::1]:8080:[2001:db8::5]:22") == ("::1", 8080, "2001:db8::5", 22)
+    assert parse_dynamic("[::1]:1080") == ("::1", 1080)
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("d5dog", (None, "d5dog", None)),
+        ("deploy@d5dog:2222", ("deploy", "d5dog", 2222)),
+        ("[::1]:2222", (None, "::1", 2222)),
+    ],
+)
+def test_parse_jump(spec, expected):
+    assert parse_jump(spec) == expected
+
+
+@pytest.mark.parametrize("spec", ["user@", "[::1]:0", "host:99999", "a:b:c:d"])
+def test_parse_jump_rejects_bad_specs(spec):
+    with pytest.raises(ValueError):
+        parse_jump(spec)
 
 
 def test_session_id_is_socket_safe():

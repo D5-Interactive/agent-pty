@@ -8,6 +8,7 @@ import os
 import posixpath
 import re
 import select
+import shlex
 import socket
 import stat
 import sys
@@ -109,7 +110,7 @@ def prune_artifacts() -> int:
         return 0
     removed = 0
     for path in SESSIONS_DIR.iterdir():
-        if not path.is_file() or path.suffix.lstrip(".") not in _ARTIFACT_SUFFIXES:
+        if path.is_dir() or path.suffix.lstrip(".") not in _ARTIFACT_SUFFIXES:
             continue
         state = read_state(path.stem)
         if state and pid_alive(state.get("pid", 0)):
@@ -145,6 +146,7 @@ def pty_payload(command: str, nonce: str) -> str:
         f"{command}\n"
         "__apty_rc=$?\n"
         f"printf '\\036APTY{nonce}E%s\\036' \"$__apty_rc\"\n"
+        f"printf '\\036APTY{nonce}C%s\\036' \"$PWD\"\n"
         "}\n"
     )
 
@@ -159,6 +161,12 @@ def parse_exec(buf: str, nonce: str) -> tuple[str, int] | None:
     if not end:
         return None
     return buf[start + len(begin) : start + end.start()], int(end.group(1))
+
+
+def parse_cwd(buf: str, nonce: str) -> str | None:
+    """The shell's working directory reported after a command."""
+    match = re.search(rf"\x1eAPTY{nonce}C(.*?)\x1e", buf, re.S)
+    return match.group(1) if match else None
 
 
 def parse_partial(buf: str, nonce: str) -> str:
@@ -196,9 +204,36 @@ def strip_ansi(text: str) -> str:
 
 
 # ── forwarding spec ──────────────────────────────────────────────
+def split_spec(spec: str) -> list[str]:
+    """Split on colons outside [brackets], so IPv6 literals stay whole."""
+    parts: list[str] = []
+    current = ""
+    depth = 0
+    for char in spec:
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+        if char == ":" and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    parts.append(current)
+    return parts
+
+
+def strip_brackets(host: str) -> str:
+    return host[1:-1] if host.startswith("[") and host.endswith("]") else host
+
+
+def format_hostport(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def parse_forward(spec: str) -> tuple[str, int, str, int]:
     """Parse [bind:]port:host:port into (bind, listen_port, host, target_port)."""
-    parts = spec.split(":")
+    parts = split_spec(spec)
     try:
         if len(parts) == 3:
             bind, listen_port, host, target_port = "127.0.0.1", int(parts[0]), parts[1], int(parts[2])
@@ -210,12 +245,12 @@ def parse_forward(spec: str) -> tuple[str, int, str, int]:
         raise ValueError(f"bad forward spec: {spec}") from exc
     if not 0 <= listen_port <= 65535 or not 1 <= target_port <= 65535:
         raise ValueError(f"bad forward port: {spec}")
-    return bind, listen_port, host, target_port
+    return strip_brackets(bind), listen_port, strip_brackets(host), target_port
 
 
 def parse_dynamic(spec: str) -> tuple[str, int]:
     """Parse [bind:]port for a SOCKS5 listener."""
-    parts = spec.split(":")
+    parts = split_spec(spec)
     if len(parts) == 1:
         bind, port = "127.0.0.1", parts[0]
     elif len(parts) == 2:
@@ -228,7 +263,43 @@ def parse_dynamic(spec: str) -> tuple[str, int]:
         raise ValueError(f"bad dynamic spec: {spec}") from exc
     if not 0 <= listen_port <= 65535:
         raise ValueError(f"bad dynamic port: {spec}")
-    return bind, listen_port
+    return strip_brackets(bind), listen_port
+
+
+def parse_jump(spec: str) -> tuple[str | None, str, int | None]:
+    """Parse [user@][host][:port] for a jump host."""
+    user = None
+    if "@" in spec:
+        user, spec = spec.split("@", 1)
+    parts = split_spec(spec)
+    try:
+        if len(parts) == 1:
+            host, port = parts[0], None
+        elif len(parts) == 2:
+            host, port = parts[0], int(parts[1])
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(f"bad jump spec: {spec}") from exc
+    host = strip_brackets(host)
+    if not host:
+        raise ValueError(f"bad jump spec: {spec}")
+    if port is not None and not 0 < port <= 65535:
+        raise ValueError(f"bad jump port: {spec}")
+    return user, host, port
+
+
+def listen_socket(bind: str, port: int) -> socket.socket:
+    """Bind a TCP listener, choosing IPv6 when the address contains a colon."""
+    family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if family == socket.AF_INET6:
+        with contextlib.suppress(OSError):
+            listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    listener.bind((bind, port))
+    listener.listen(16)
+    return listener
 
 
 def _pump(left, right) -> None:
@@ -366,7 +437,16 @@ class SessionServer:
         self.agent: bool = config.get("agent", True) is not False
         self.connect_timeout: int = int(config.get("connect_timeout") or 20)
         self.keepalive: int = int(config.get("keepalive", 30))
+        self.forward_agent: bool = bool(config.get("forward_agent"))
+        self.jump: list[str] = list(config.get("jump") or [])
+        self.jump_password: str | None = config.get("jump_password") or None
+        self.reconnect_attempts: int = int(config.get("reconnect") or 0)
         self.ttl_seconds: int = int(config["ttl"]) * 60
+        self._target_host: str = self.host
+        self._connected = False
+        self._reconnecting = False
+        self._cwd: str | None = None
+        self._jump_clients: list[paramiko.SSHClient] = []
         self.started_at = datetime.now(UTC)
 
         self._cond = threading.Condition()
@@ -386,8 +466,16 @@ class SessionServer:
     # -- lifecycle
     def start(self) -> None:
         ensure_dirs()
+        self._resolve_target()
+        self._connect()
+        self._write_state()
+        audit(self.id, "connect", host=self.host, user=self.user, port=self.port, name=self.name)
+        threading.Thread(target=self._reader, name="pty-reader", daemon=True).start()
+        threading.Thread(target=self._ttl_guard, name="ttl", daemon=True).start()
+
+    def _resolve_target(self) -> None:
         settings = ssh_config(self.host)
-        hostname = str(settings.get("hostname") or self.host)
+        self._target_host = str(settings.get("hostname") or self.host)
         self.user = self.user or settings.get("user") or os.environ.get("USER") or "root"
         self.port = self.port or int(settings.get("port") or 22)
         if not self.key_file and not self.password:
@@ -395,39 +483,194 @@ class SessionServer:
             if keys:
                 self.key_file = os.path.expanduser(keys[0])
 
-        self._client = self._build_client()
-        self._client.connect(
-            hostname=hostname,
+    def _jump_specs(self) -> list[str]:
+        if self.jump:
+            return self.jump
+        proxy = str(ssh_config(self.host).get("proxyjump") or "")
+        if proxy and proxy.lower() != "none":
+            return [part.strip() for part in proxy.split(",") if part.strip()]
+        return []
+
+    def _connect_target(self) -> paramiko.SSHClient:
+        resolved = []
+        for spec in self._jump_specs():
+            jump_user, jump_host, jump_port = parse_jump(spec)
+            settings = ssh_config(jump_host)
+            jump_key = None
+            if not self.jump_password:
+                keys = settings.get("identityfile") or []
+                if keys:
+                    jump_key = os.path.expanduser(keys[0])
+            resolved.append(
+                (
+                    str(settings.get("hostname") or jump_host),
+                    jump_user or settings.get("user") or self.user,
+                    jump_port or int(settings.get("port") or 22),
+                    jump_key,
+                )
+            )
+
+        sock = None
+        self._jump_clients = []
+        for index, (hostname, user, port, key) in enumerate(resolved):
+            if index + 1 < len(resolved):
+                next_host, next_port = resolved[index + 1][0], resolved[index + 1][2]
+            else:
+                next_host, next_port = self._target_host, self.port
+            client = self._build_client()
+            client.connect(
+                hostname=hostname,
+                port=port,
+                username=user,
+                password=self.jump_password,
+                key_filename=key,
+                sock=sock,
+                timeout=self.connect_timeout,
+                allow_agent=self.agent,
+                look_for_keys=False,
+            )
+            transport = client.get_transport()
+            if transport is None:
+                raise RuntimeError(f"jump transport unavailable: {hostname}")
+            transport.set_keepalive(self.keepalive)
+            if not self.insecure:
+                self._save_hosts(client)
+            self._jump_clients.append(client)
+            sock = transport.open_channel(
+                "direct-tcpip", (next_host, next_port), ("127.0.0.1", 0), timeout=self.connect_timeout
+            )
+
+        client = self._build_client()
+        client.connect(
+            hostname=self._target_host,
             port=self.port,
             username=self.user,
             password=self.password,
             key_filename=self.key_file,
+            sock=sock,
             timeout=self.connect_timeout,
             allow_agent=self.agent,
             look_for_keys=False,
         )
-        if not self.insecure:
-            with contextlib.suppress(OSError):
-                self._client.save_host_keys(str(KNOWN_HOSTS))
-                os.chmod(KNOWN_HOSTS, 0o600)
+        return client
 
-        transport = self._client.get_transport()
+    def _save_hosts(self, client: paramiko.SSHClient) -> None:
+        with contextlib.suppress(OSError):
+            client.save_host_keys(str(KNOWN_HOSTS))
+            os.chmod(KNOWN_HOSTS, 0o600)
+
+    def _connect(self) -> None:
+        client = self._connect_target()
+        self._client = client
+        if not self.insecure:
+            self._save_hosts(client)
+        transport = client.get_transport()
         if transport is None:
             raise RuntimeError("SSH transport unavailable")
         transport.set_keepalive(self.keepalive)
         cols, rows = _terminal_size()
         channel = transport.open_session()
         channel.get_pty(term=os.environ.get("TERM", "xterm-256color"), width=cols, height=rows)
-        channel.invoke_shell()
         self._chan = channel
-        self._transcript = transcript_path(self.id).open("ab")  # noqa: SIM115 - lives with the daemon
-        os.chmod(transcript_path(self.id), 0o600)
+        if self.forward_agent:
+            # The request must precede the shell, so sshd exports SSH_AUTH_SOCK.
+            self._request_agent_forwarding()
+        channel.invoke_shell()
+        if self._transcript is None:
+            self._transcript = transcript_path(self.id).open("ab")  # noqa: SIM115 - lives with the daemon
+            os.chmod(transcript_path(self.id), 0o600)
+        with self._cond:
+            self._connected = True
 
-        self._write_state()
-        audit(self.id, "connect", host=self.host, user=self.user, port=self.port, name=self.name)
+    def _request_agent_forwarding(self) -> None:
+        if not os.environ.get("SSH_AUTH_SOCK"):
+            raise RuntimeError("--forward-agent needs SSH_AUTH_SOCK")
+        if self._chan is None:
+            return
+        self._chan.request_forward_agent(self._agent_handler)
 
-        threading.Thread(target=self._reader, name="pty-reader", daemon=True).start()
-        threading.Thread(target=self._ttl_guard, name="ttl", daemon=True).start()
+    def _agent_handler(self, channel) -> None:
+        path = os.environ.get("SSH_AUTH_SOCK")
+        if not path:
+            channel.close()
+            return
+
+        def proxy() -> None:
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(10)
+                sock.connect(path)
+                sock.settimeout(None)
+            except OSError:
+                channel.close()
+                return
+            _pump(channel, sock)
+
+        threading.Thread(target=proxy, daemon=True).start()
+
+    def _ready(self) -> tuple[bool, str]:
+        if self._client is None or self._stop.is_set():
+            return False, "session is closed"
+        if not self._connected:
+            return False, "session is reconnecting"
+        return True, ""
+
+    def _restore(self) -> None:
+        chan = self._chan
+        if chan is None:
+            return
+        if self._cwd:
+            chan.sendall(f"cd {shlex.quote(self._cwd)}\n")
+        previous = [(entry["id"], entry["direction"], entry["spec"]) for entry in self._forwards]
+        audit(self.id, "restore", cwd=self._cwd, forwards=len(previous))
+        for entry in self._forwards:
+            self._close_forward(entry)
+        self._forwards.clear()
+        for forward_id, direction, spec in previous:
+            result = self.add_forward(direction, spec, forward_id=forward_id)
+            if not result.get("ok"):
+                audit(self.id, "restore_forward_failed", direction=direction, spec=spec, error=result.get("error"))
+
+    def _on_disconnect(self) -> None:
+        if self._stop.is_set():
+            return
+        with self._cond:
+            self._connected = False
+            self._chan = None
+            start_loop = bool(self.reconnect_attempts) and not self._reconnecting
+            if start_loop:
+                self._reconnecting = True
+        audit(self.id, "disconnect")
+        if not self.reconnect_attempts:
+            self.shutdown()
+            return
+        if start_loop:
+            threading.Thread(target=self._reconnect_loop, name="reconnect", daemon=True).start()
+
+    def _reconnect_loop(self) -> None:
+        delay = 1.0
+        for attempt in range(1, self.reconnect_attempts + 1):
+            if self._stop.wait(delay):
+                break
+            self._touch()
+            try:
+                self._connect()
+            except Exception as exc:  # noqa: BLE001 - any connect failure retries
+                audit(self.id, "reconnect_failed", attempt=attempt, error=str(exc))
+                delay = min(delay * 2, 30)
+                continue
+            audit(self.id, "reconnect", attempt=attempt)
+            with self._cond:
+                self._reconnecting = False
+            try:
+                self._restore()
+            except Exception as exc:  # noqa: BLE001 - a failed restore must not stop the session
+                audit(self.id, "restore_failed", error=str(exc))
+            threading.Thread(target=self._reader, name="pty-reader", daemon=True).start()
+            return
+        with self._cond:
+            self._reconnecting = False
+        self.shutdown()
 
     def _build_client(self) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
@@ -462,16 +705,20 @@ class SessionServer:
             return
         self._stop.set()
         for entry in self._forwards:
+            if entry.get("stop") is not None:
+                entry["stop"].set()
             with contextlib.suppress(Exception):
                 entry["closer"]()
         self._forwards.clear()
-        for closer in (self._chan, self._client, self._transcript):
+        for closer in (self._chan, self._client, self._transcript, *self._jump_clients):
             if closer is not None:
                 with contextlib.suppress(Exception):
                     closer.close()
         self._chan = None
         self._client = None
         self._transcript = None
+        self._jump_clients = []
+        self._connected = False
         audit(self.id, "close")
         sock_path(self.id).unlink(missing_ok=True)
         state_path(self.id).unlink(missing_ok=True)
@@ -546,7 +793,7 @@ class SessionServer:
                     attached.sendall(data)
                 except OSError:
                     self._detach()
-        self._stop.set()
+        self._on_disconnect()
 
     def _detach(self) -> None:
         with self._cond:
@@ -555,9 +802,10 @@ class SessionServer:
     # -- operations
     def exec(self, command: str, timeout: float = 120) -> dict:
         """Run one command inside the live PTY shell, keeping its state."""
+        ready, error = self._ready()
         chan = self._chan
-        if chan is None or self._stop.is_set():
-            return {"ok": False, "error": "session is closed"}
+        if not ready or chan is None:
+            return {"ok": False, "error": error or "session is reconnecting"}
         if not self._exec_lock.acquire(blocking=False):
             return {"ok": False, "error": "session is attached to a terminal"}
         nonce = uuid.uuid4().hex[:8]
@@ -578,7 +826,7 @@ class SessionServer:
                 self._buf.clear()
             chan.sendall(pty_payload(command, nonce))
             deadline = time.time() + timeout
-            while time.time() < deadline and not self._stop.is_set():
+            while time.time() < deadline and not self._stop.is_set() and self._chan is chan:
                 self._touch()
                 with self._cond:
                     parsed = parse_exec(self._buf.decode("utf-8", errors="replace"), nonce)
@@ -586,10 +834,22 @@ class SessionServer:
                         self._cond.wait(0.05)
                 if parsed is not None:
                     output, code = parsed
+                    cwd = parse_cwd(self._buffer_text(), nonce)
+                    if cwd:
+                        self._cwd = cwd
                     audit(self.id, "exec", command=command[:200], exit_code=code)
                     return {"ok": True, "output": clean_output(output), "exit_code": code}
                 if self._interrupt.is_set():
                     break
+            if self._chan is not chan:
+                partial = clean_output(parse_partial(self._buffer_text(), nonce))
+                audit(self.id, "exec", command=command[:200], exit_code=255, connection_lost=True)
+                return {
+                    "ok": False,
+                    "error": "connection lost, session is reconnecting",
+                    "output": partial,
+                    "exit_code": 255,
+                }
             interrupted = self._interrupt.is_set()
             if not interrupted:
                 with contextlib.suppress(Exception):
@@ -622,9 +882,10 @@ class SessionServer:
 
     def write(self, data: str) -> dict:
         """Send raw input to the PTY shell."""
+        ready, error = self._ready()
         chan = self._chan
-        if chan is None or self._stop.is_set():
-            return {"ok": False, "error": "session is closed"}
+        if not ready or chan is None:
+            return {"ok": False, "error": error or "session is reconnecting"}
         if not self._exec_lock.acquire(blocking=False):
             return {"ok": False, "error": "session is busy"}
         try:
@@ -640,9 +901,12 @@ class SessionServer:
     def interrupt(self) -> dict:
         chan = self._chan
         if chan is None:
-            return {"ok": False, "error": "session is closed"}
+            return {"ok": False, "error": "session is reconnecting" if self.reconnect_attempts else "session is closed"}
         self._interrupt.set()
-        chan.sendall(b"\x03")
+        try:
+            chan.sendall(b"\x03")
+        except (OSError, paramiko.SSHException) as exc:
+            return {"ok": False, "error": str(exc)}
         self._touch()
         audit(self.id, "interrupt")
         return {"ok": True}
@@ -656,13 +920,17 @@ class SessionServer:
     def resize(self, cols: int, rows: int) -> dict:
         if self._chan is None:
             return {"ok": False, "error": "session is closed"}
-        self._chan.resize_pty(width=cols, height=rows)
+        try:
+            self._chan.resize_pty(width=cols, height=rows)
+        except (OSError, paramiko.SSHException) as exc:
+            return {"ok": False, "error": str(exc)}
         return {"ok": True}
 
     # -- forwarding
-    def add_forward(self, direction: str, spec: str) -> dict:
-        if self._client is None or self._stop.is_set():
-            return {"ok": False, "error": "session is closed"}
+    def add_forward(self, direction: str, spec: str, forward_id: int | None = None) -> dict:
+        ready, error = self._ready()
+        if not ready:
+            return {"ok": False, "error": error}
         try:
             if direction == "dynamic":
                 bind, listen_port = parse_dynamic(spec)
@@ -673,17 +941,15 @@ class SessionServer:
             return {"ok": False, "error": str(exc)}
 
         if direction in ("local", "dynamic"):
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                listener.bind((bind, listen_port))
-                listener.listen(16)
+                listener = listen_socket(bind, listen_port)
             except OSError as exc:
-                listener.close()
                 return {"ok": False, "error": str(exc)}
             listen_port = listener.getsockname()[1]
+            stop = threading.Event()
             accepter = self._accept_local if direction == "local" else self._accept_socks
-            threading.Thread(target=accepter, args=(listener, host, target_port), daemon=True).start()
+            thread = threading.Thread(target=accepter, args=(listener, host, target_port, stop), daemon=True)
+            thread.start()
             closer = listener.close
         elif direction == "remote":
             transport = self._client.get_transport()
@@ -698,26 +964,41 @@ class SessionServer:
             except (OSError, paramiko.SSHException) as exc:
                 return {"ok": False, "error": str(exc)}
             closer = lambda: transport.cancel_port_forward(bind, listen_port)  # noqa: E731
+            stop, thread = None, None
         else:
             return {"ok": False, "error": f"unknown direction: {direction}"}
 
-        with self._cond:
-            self._forward_seq += 1
-            forward_id = self._forward_seq
+        if forward_id is None:
+            with self._cond:
+                self._forward_seq += 1
+                forward_id = self._forward_seq
         entry = {
             "id": forward_id,
             "direction": direction,
-            "listen": f"{bind}:{listen_port}",
-            "target": f"{host}:{target_port}",
+            "spec": spec,
+            "listen": format_hostport(bind, listen_port),
+            "target": "socks5" if direction == "dynamic" else format_hostport(host, target_port),
             "closer": closer,
+            "stop": stop,
+            "thread": thread,
         }
         self._forwards.append(entry)
         audit(self.id, "forward", direction=direction, listen=entry["listen"], target=entry["target"])
         return {"ok": True, **{k: entry[k] for k in ("id", "direction", "listen", "target")}}
 
-    def _accept_local(self, listener: socket.socket, host: str, port: int) -> None:
+    def _close_forward(self, entry: dict) -> None:
+        stop = entry.get("stop")
+        if stop is not None:
+            stop.set()
+        with contextlib.suppress(Exception):
+            entry["closer"]()
+        thread = entry.get("thread")
+        if thread is not None:
+            thread.join(1.5)
+
+    def _accept_local(self, listener: socket.socket, host: str, port: int, stop: threading.Event) -> None:
         listener.settimeout(0.5)
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not stop.is_set():
             try:
                 conn, _ = listener.accept()
             except TimeoutError:
@@ -739,9 +1020,9 @@ class SessionServer:
             return
         _pump(conn, channel)
 
-    def _accept_socks(self, listener: socket.socket, _host: str, _port: int) -> None:
+    def _accept_socks(self, listener: socket.socket, _host: str, _port: int, stop: threading.Event) -> None:
         listener.settimeout(0.5)
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not stop.is_set():
             try:
                 conn, _ = listener.accept()
             except TimeoutError:
@@ -783,8 +1064,7 @@ class SessionServer:
     def remove_forward(self, forward_id: int) -> dict:
         for entry in list(self._forwards):
             if entry["id"] == forward_id:
-                with contextlib.suppress(Exception):
-                    entry["closer"]()
+                self._close_forward(entry)
                 self._forwards.remove(entry)
                 audit(self.id, "unforward", id=forward_id)
                 return {"ok": True}
@@ -795,6 +1075,9 @@ class SessionServer:
 
     # -- file transfer
     def upload(self, local: str, remote: str | None, directory: bool) -> dict:
+        ready, error = self._ready()
+        if not ready:
+            return {"ok": False, "error": error}
         sftp = self._sftp()
         if sftp is None:
             return {"ok": False, "error": "sftp unavailable"}
@@ -820,6 +1103,9 @@ class SessionServer:
             sftp.close()
 
     def download(self, remote: str, local: str | None, directory: bool) -> dict:
+        ready, error = self._ready()
+        if not ready:
+            return {"ok": False, "error": error}
         sftp = self._sftp()
         if sftp is None:
             return {"ok": False, "error": "sftp unavailable"}
@@ -859,6 +1145,10 @@ class SessionServer:
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "uptime_seconds": int((datetime.now(UTC) - self.started_at).total_seconds()),
             "attached": attached,
+            "connected": self._connected,
+            "reconnect": self.reconnect_attempts,
+            "jumps": self._jump_specs(),
+            "forward_agent": self.forward_agent,
             "running": self._exec_lock.locked(),
             "transcript": str(transcript_path(self.id)),
             "forwards": self.forwards(),

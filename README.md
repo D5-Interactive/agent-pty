@@ -29,6 +29,7 @@ agent-pty shell  -s web                       # full PTY, Ctrl-] detaches
 agent-pty logs   -s web -n 50                 # PTY transcript
 agent-pty forward -s web -L 8080:localhost:80 # local tunnel to the remote port
 agent-pty forward -s web -D 1080              # SOCKS5 proxy through the session
+agent-pty connect web -J bastion             # reach web through a jump host
 agent-pty upload ./build.tar.gz '~/releases/'
 agent-pty sessions
 agent-pty close  -s web
@@ -70,6 +71,10 @@ when exactly one session is live.
 | `-n, --name` | `connect` | Friendly session name, usable with `-s`. |
 | `--insecure` | `connect` | Do not verify or record host keys. |
 | `--agent / --no-agent` | `connect` | Use ssh-agent keys, on by default. |
+| `-J, --jump` | `connect` | `[USER@]HOST[:PORT]`, repeatable for a chain. |
+| `--jump-password` | `connect` | Password for jump hosts; they otherwise use ssh config keys or the agent. |
+| `--forward-agent` | `connect` | Forward the local ssh-agent to the remote side. |
+| `--reconnect` | `connect` | Reconnect attempts after a dropped connection, default 0. |
 | `--connect-timeout` | `connect` | SSH connect timeout in seconds, default 20. |
 | `--keepalive` | `connect` | SSH keepalive interval in seconds, default 30, 0 disables. |
 | `-s, --session` | most commands | Session id, name, or unique id prefix. |
@@ -99,7 +104,8 @@ agent-pty forward -s web --remove 1
 ```
 
 For `-L` and `-D`, `HOST:PORT` is resolved on the remote side. For `-R`, it is
-resolved on your side. All default to binding `127.0.0.1`.
+resolved on your side. All default to binding `127.0.0.1`. IPv6 literals use
+brackets, for example `-L [::1]:8080:localhost:80`.
 
 ```bash
 curl --socks5-hostname 127.0.0.1:1080 http://internal.service/
@@ -127,6 +133,13 @@ curl --socks5-hostname 127.0.0.1:1080 http://internal.service/
 - Every operation is appended to `~/.agent-pty/audit.jsonl`: timestamp,
   session id, action, command, exit code, transfer paths, forwards. Passwords
   are never written there.
+- Jump hosts are honoured from `-J`, or from `ProxyJump` in `~/.ssh/config`.
+  Chains of any length work, and each hop uses its own ssh config or SSH agent.
+- `--forward-agent` requests agent forwarding before the shell starts, so the
+  remote shell gets `SSH_AUTH_SOCK`. It needs `SSH_AUTH_SOCK` locally.
+- `--reconnect N` retries a dropped connection with backoff. A reconnected
+  session restores the last known working directory and re-creates its port
+  forwards. Shell environment, aliases and functions are not restored.
 - The idle TTL closes abandoned sessions and their forwards.
 - Remote `~` is expanded for `upload` and `download` targets.
 - `upload` creates missing remote parent directories and copies directories
