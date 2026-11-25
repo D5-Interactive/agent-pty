@@ -1,5 +1,6 @@
 """Offline checks for the CLI surface, exec framing, transfers and forwards."""
 
+import base64
 import json
 import os
 import socket
@@ -12,12 +13,14 @@ from agent_pty import session as session_module
 from agent_pty.main import _resolve, _session_id, cli
 from agent_pty.session import (
     clean_output,
+    filter_state,
     parse_cwd,
     parse_dynamic,
     parse_exec,
     parse_forward,
     parse_jump,
     parse_partial,
+    parse_state,
     prune_artifacts,
     pty_payload,
     strip_ansi,
@@ -85,6 +88,28 @@ def test_pty_payload_brackets_the_command_in_one_group():
     assert payload.count("\\036APTYabc12345B\\036") == 1
     assert payload.count("\\036APTYabc12345E%s\\036") == 1
     assert "APTYabc12345C%s" in payload and '"$PWD"' in payload
+
+
+def test_parse_state_decodes_the_snapshot():
+    nonce = "abc12345"
+    blob = base64.b64encode(b"export A=1\n").decode()
+    buf = f"x\x1eAPTY{nonce}S\x1e{blob}\x1eAPTY{nonce}s\x1e"
+    assert parse_state(buf, nonce) == "export A=1\n"
+    assert parse_state("no markers", nonce) is None
+    assert parse_state(f"\x1eAPTY{nonce}S\x1e!!!\x1eAPTY{nonce}s\x1e", nonce) is None
+
+
+def test_filter_state_drops_connection_scoped_variables():
+    text = 'HOME=/x\nSSH_AUTH_SOCK=/tmp/old\ndeclare -x SSH_TTY=/dev/pts/1\nalias ll="ls -l"\n'
+    assert filter_state(text) == 'HOME=/x\nalias ll="ls -l"\n'
+
+
+def test_pty_payload_adds_state_markers_only_when_asked():
+    plain = pty_payload("pwd", "abc12345")
+    assert "APTYabc12345S" not in plain
+    wrapped = pty_payload("pwd", "abc12345", "typeset -gx")
+    assert "APTYabc12345S" in wrapped and "APTYabc12345s" in wrapped
+    assert "typeset -gx | base64" in wrapped
 
 
 def test_parse_cwd_reads_the_directory_marker():

@@ -1,6 +1,6 @@
 [project]
 name = "agent-pty"
-version = "0.6.0"
+version = "0.7.0"
 description = "SSH with persistent background PTY sessions, port forwarding, file transfer, and audit logging"
 readme = "README.md"
 license = "MIT"

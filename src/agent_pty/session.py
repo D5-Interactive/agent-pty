@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
@@ -135,20 +136,33 @@ def ssh_config(host: str) -> dict:
         return {}
 
 
-def pty_payload(command: str, nonce: str) -> str:
+STATE_COMMANDS = {
+    "zsh": "{ typeset -gx; alias -L; functions; } 2>/dev/null",
+    "bash": "{ declare -px; alias -p; declare -f; } 2>/dev/null",
+}
+
+
+def pty_payload(command: str, nonce: str, state_cmd: str | None = None) -> str:
     """One compound command whose markers bracket only the command's output.
 
     Prompts, PS2, echoed input and pre/post-command hooks all print outside the
     markers, so the captured slice is the command output alone.
     """
-    return (
-        f"{{ printf '\\036APTY{nonce}B\\036'\n"
-        f"{command}\n"
-        "__apty_rc=$?\n"
-        f"printf '\\036APTY{nonce}E%s\\036' \"$__apty_rc\"\n"
-        f"printf '\\036APTY{nonce}C%s\\036' \"$PWD\"\n"
-        "}\n"
-    )
+    parts = [
+        f"{{ printf '\\036APTY{nonce}B\\036'\n",
+        f"{command}\n",
+        "__apty_rc=$?\n",
+        f"printf '\\036APTY{nonce}E%s\\036' \"$__apty_rc\"\n",
+        f"printf '\\036APTY{nonce}C%s\\036' \"$PWD\"\n",
+    ]
+    if state_cmd:
+        parts += [
+            f"printf '\\036APTY{nonce}S\\036'\n",
+            f"{state_cmd} | base64 | tr -d '\\n'\n",
+            f"printf '\\036APTY{nonce}s\\036'\n",
+        ]
+    parts.append("}\n")
+    return "".join(parts)
 
 
 def parse_exec(buf: str, nonce: str) -> tuple[str, int] | None:
@@ -167,6 +181,34 @@ def parse_cwd(buf: str, nonce: str) -> str | None:
     """The shell's working directory reported after a command."""
     match = re.search(rf"\x1eAPTY{nonce}C(.*?)\x1e", buf, re.S)
     return match.group(1) if match else None
+
+
+def parse_state(buf: str, nonce: str) -> str | None:
+    """Decode the base64 shell state snapshot emitted after a command."""
+    begin = f"\x1eAPTY{nonce}S\x1e"
+    start = buf.rfind(begin)
+    if start < 0:
+        return None
+    end = buf.find(f"\x1eAPTY{nonce}s\x1e", start)
+    if end < 0:
+        return None
+    blob = buf[start + len(begin) : end].strip()
+    try:
+        return base64.b64decode(blob, validate=True).decode("utf-8", errors="replace")
+    except ValueError:
+        return None
+
+
+_STATE_DROP = re.compile(
+    r"^(?:declare -[A-Za-z]*x[A-Za-z]* |typeset -[A-Za-z]*x[A-Za-z]* )?"
+    r"(?:SSH_AUTH_SOCK|SSH_CONNECTION|SSH_CLIENT|SSH_TTY|SSH_AGENT_PID)="
+)
+
+
+def filter_state(text: str) -> str:
+    """Keep replayable shell state, dropping per-connection SSH variables."""
+    lines = [line for line in text.splitlines() if not _STATE_DROP.match(line)]
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def parse_partial(buf: str, nonce: str) -> str:
@@ -439,13 +481,15 @@ class SessionServer:
         self.keepalive: int = int(config.get("keepalive", 30))
         self.forward_agent: bool = bool(config.get("forward_agent"))
         self.jump: list[str] = list(config.get("jump") or [])
-        self.jump_password: str | None = config.get("jump_password") or None
+        self.jump_passwords: list[str] = list(config.get("jump_passwords") or [])
         self.reconnect_attempts: int = int(config.get("reconnect") or 0)
         self.ttl_seconds: int = int(config["ttl"]) * 60
         self._target_host: str = self.host
         self._connected = False
         self._reconnecting = False
         self._cwd: str | None = None
+        self._shell: str | None = None
+        self._shell_state: str = ""
         self._jump_clients: list[paramiko.SSHClient] = []
         self.started_at = datetime.now(UTC)
 
@@ -493,11 +537,12 @@ class SessionServer:
 
     def _connect_target(self) -> paramiko.SSHClient:
         resolved = []
-        for spec in self._jump_specs():
+        for index, spec in enumerate(self._jump_specs()):
             jump_user, jump_host, jump_port = parse_jump(spec)
             settings = ssh_config(jump_host)
+            password = self.jump_passwords[index] if index < len(self.jump_passwords) else None
             jump_key = None
-            if not self.jump_password:
+            if not password:
                 keys = settings.get("identityfile") or []
                 if keys:
                     jump_key = os.path.expanduser(keys[0])
@@ -522,7 +567,7 @@ class SessionServer:
                 hostname=hostname,
                 port=port,
                 username=user,
-                password=self.jump_password,
+                password=self.jump_passwords[index] if index < len(self.jump_passwords) else None,
                 key_filename=key,
                 sock=sock,
                 timeout=self.connect_timeout,
@@ -568,6 +613,8 @@ class SessionServer:
         if transport is None:
             raise RuntimeError("SSH transport unavailable")
         transport.set_keepalive(self.keepalive)
+        if self.reconnect_attempts:
+            self._shell = self._detect_shell(transport)
         cols, rows = _terminal_size()
         channel = transport.open_session()
         channel.get_pty(term=os.environ.get("TERM", "xterm-256color"), width=cols, height=rows)
@@ -581,6 +628,24 @@ class SessionServer:
             os.chmod(transcript_path(self.id), 0o600)
         with self._cond:
             self._connected = True
+
+    def _detect_shell(self, transport: paramiko.Transport) -> str | None:
+        """Name of the login shell, when it is one whose state can be replayed."""
+        try:
+            chan = transport.open_session()
+            chan.settimeout(5)
+            chan.exec_command('basename "${SHELL:-sh}"')
+            data = bytearray()
+            while True:
+                chunk = chan.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+            chan.close()
+        except (OSError, paramiko.SSHException):
+            return None
+        name = data.decode("utf-8", errors="replace").strip()
+        return name if name in STATE_COMMANDS else None
 
     def _request_agent_forwarding(self) -> None:
         if not os.environ.get("SSH_AUTH_SOCK"):
@@ -619,6 +684,8 @@ class SessionServer:
         chan = self._chan
         if chan is None:
             return
+        if self._shell_state:
+            self._restore_state()
         if self._cwd:
             chan.sendall(f"cd {shlex.quote(self._cwd)}\n")
         previous = [(entry["id"], entry["direction"], entry["spec"]) for entry in self._forwards]
@@ -630,6 +697,22 @@ class SessionServer:
             result = self.add_forward(direction, spec, forward_id=forward_id)
             if not result.get("ok"):
                 audit(self.id, "restore_forward_failed", direction=direction, spec=spec, error=result.get("error"))
+
+    def _restore_state(self) -> None:
+        """Write the captured shell state to the remote and source it."""
+        if self._client is None or self._chan is None or not self._shell_state:
+            return
+        sftp = self._client.open_sftp()
+        try:
+            home = sftp.normalize(".")
+            path = posixpath.join(home, f".agent-pty-restore-{self.id}.sh")
+            with sftp.file(path, "w") as handle:
+                handle.write(self._shell_state)
+            sftp.chmod(path, 0o600)
+        finally:
+            sftp.close()
+        self._chan.sendall(f". {shlex.quote(path)}; rm -f {shlex.quote(path)}\n")
+        audit(self.id, "restore_state", bytes=len(self._shell_state))
 
     def _on_disconnect(self) -> None:
         if self._stop.is_set():
@@ -824,7 +907,7 @@ class SessionServer:
                 time.sleep(0.02)
             with self._cond:
                 self._buf.clear()
-            chan.sendall(pty_payload(command, nonce))
+            chan.sendall(pty_payload(command, nonce, STATE_COMMANDS.get(self._shell) if self._shell else None))
             deadline = time.time() + timeout
             while time.time() < deadline and not self._stop.is_set() and self._chan is chan:
                 self._touch()
@@ -834,9 +917,22 @@ class SessionServer:
                         self._cond.wait(0.05)
                 if parsed is not None:
                     output, code = parsed
-                    cwd = parse_cwd(self._buffer_text(), nonce)
+                    buffer = self._buffer_text()
+                    cwd = parse_cwd(buffer, nonce)
                     if cwd:
                         self._cwd = cwd
+                    if self._shell:
+                        snapshot = parse_state(buffer, nonce)
+                        if snapshot is None:
+                            deadline = time.time() + 2
+                            while time.time() < deadline:
+                                snapshot = parse_state(self._buffer_text(), nonce)
+                                if snapshot is not None:
+                                    break
+                                with self._cond:
+                                    self._cond.wait(0.02)
+                        if snapshot:
+                            self._shell_state = filter_state(snapshot)[:1_048_576] or self._shell_state
                     audit(self.id, "exec", command=command[:200], exit_code=code)
                     return {"ok": True, "output": clean_output(output), "exit_code": code}
                 if self._interrupt.is_set():
@@ -1149,6 +1245,8 @@ class SessionServer:
             "reconnect": self.reconnect_attempts,
             "jumps": self._jump_specs(),
             "forward_agent": self.forward_agent,
+            "shell": self._shell,
+            "state_bytes": len(self._shell_state),
             "running": self._exec_lock.locked(),
             "transcript": str(transcript_path(self.id)),
             "forwards": self.forwards(),

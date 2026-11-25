@@ -10,6 +10,7 @@ close it or its idle TTL expires.
 ## Install
 
 ```bash
+uv tool install agent-pty            # from PyPI
 uv tool install --from . agent-pty   # local checkout
 uv sync && uv run agent-pty --help   # development
 ```
@@ -72,7 +73,7 @@ when exactly one session is live.
 | `--insecure` | `connect` | Do not verify or record host keys. |
 | `--agent / --no-agent` | `connect` | Use ssh-agent keys, on by default. |
 | `-J, --jump` | `connect` | `[USER@]HOST[:PORT]`, repeatable for a chain. |
-| `--jump-password` | `connect` | Password for jump hosts; they otherwise use ssh config keys or the agent. |
+| `--jump-password` | `connect` | Password for a jump host, repeatable in `-J` order. |
 | `--forward-agent` | `connect` | Forward the local ssh-agent to the remote side. |
 | `--reconnect` | `connect` | Reconnect attempts after a dropped connection, default 0. |
 | `--connect-timeout` | `connect` | SSH connect timeout in seconds, default 20. |
@@ -137,9 +138,14 @@ curl --socks5-hostname 127.0.0.1:1080 http://internal.service/
   Chains of any length work, and each hop uses its own ssh config or SSH agent.
 - `--forward-agent` requests agent forwarding before the shell starts, so the
   remote shell gets `SSH_AUTH_SOCK`. It needs `SSH_AUTH_SOCK` locally.
-- `--reconnect N` retries a dropped connection with backoff. A reconnected
-  session restores the last known working directory and re-creates its port
-  forwards. Shell environment, aliases and functions are not restored.
+- `--reconnect N` retries a dropped connection with backoff. With a zsh or bash
+  login shell it also restores exported variables, aliases and functions, plus
+  the last working directory, and re-creates port forwards. Running processes
+  and history are not restored. Other shells get the directory and forwards.
+- Reconnect state is captured after each `exec`, which adds a small delay per
+  command. Sessions without `--reconnect` skip the capture.
+- Each `--jump-password` applies to the matching `-J` hop; pass one per hop, or
+  none to use ssh config keys or the agent.
 - The idle TTL closes abandoned sessions and their forwards.
 - Remote `~` is expanded for `upload` and `download` targets.
 - `upload` creates missing remote parent directories and copies directories

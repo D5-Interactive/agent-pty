@@ -143,7 +143,10 @@ def cli() -> None:
     "-J", "--jump", "jumps", multiple=True, metavar="[USER@]HOST[:PORT]", help="Jump host, repeatable for a chain."
 )
 @click.option(
-    "--jump-password", default=None, help="Password for jump hosts. They otherwise use ssh config keys or the agent."
+    "--jump-password",
+    "jump_passwords",
+    multiple=True,
+    help="Password for a jump host, repeatable in -J order. Hops without one use ssh config keys or the agent.",
 )
 @click.option("--forward-agent", is_flag=True, help="Forward the local ssh-agent to the remote side.")
 @click.option(
@@ -162,7 +165,7 @@ def connect(
     connect_timeout: int,
     keepalive: int,
     jumps: tuple[str, ...],
-    jump_password: str | None,
+    jump_passwords: tuple[str, ...],
     forward_agent: bool,
     reconnect: int,
 ) -> None:
@@ -175,6 +178,8 @@ def connect(
         if not sys.stdin.isatty():
             raise click.ClickException("provide --password or --key-file")
         password = click.prompt("SSH password", hide_input=True)
+    if jump_passwords and len(jump_passwords) != len(jumps):
+        raise click.ClickException("pass one --jump-password per -J hop")
 
     ensure_dirs()
     session_id = _session_id(name, user, host)
@@ -191,7 +196,7 @@ def connect(
         "connect_timeout": connect_timeout,
         "keepalive": keepalive,
         "jump": list(jumps),
-        "jump_password": jump_password,
+        "jump_passwords": list(jump_passwords),
         "forward_agent": forward_agent,
         "reconnect": reconnect,
         "ttl": ttl,
@@ -471,6 +476,8 @@ def info_cmd(name: str | None, as_json: bool) -> None:
         "reconnect",
         "jumps",
         "forward_agent",
+        "shell",
+        "state_bytes",
         "running",
         "transcript",
     )
