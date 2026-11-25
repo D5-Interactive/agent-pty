@@ -28,6 +28,7 @@ agent-pty exec -s web 'pwd'                   # /srv/app, state kept
 agent-pty shell  -s web                       # full PTY, Ctrl-] detaches
 agent-pty logs   -s web -n 50                 # PTY transcript
 agent-pty forward -s web -L 8080:localhost:80 # local tunnel to the remote port
+agent-pty forward -s web -D 1080              # SOCKS5 proxy through the session
 agent-pty upload ./build.tar.gz '~/releases/'
 agent-pty sessions
 agent-pty close  -s web
@@ -49,12 +50,13 @@ when exactly one session is live.
 | `interrupt` | Send Ctrl-C, and stop a running `exec` with exit code 130. |
 | `logs` | Print the session transcript, with `-f` to follow it. |
 | `rename NEWNAME` | Give the session a new name. |
-| `forward` | Add, list, or remove SSH port forwards. |
+| `forward` | Add, list, or remove SSH port forwards, including a SOCKS5 proxy. |
 | `upload FILE [REMOTE]` | Upload one file. A trailing `/` on REMOTE means that directory. |
 | `upload-dir DIR [REMOTE]` | Upload a directory tree. |
 | `download FILE [LOCAL]` | Download one file. A trailing `/` on LOCAL means that directory. |
 | `download-dir DIR [LOCAL]` | Download a directory tree. |
 | `close` | Close a session and its SSH connection. `--all` closes every session. |
+| `prune` | Delete files left by closed or crashed sessions. |
 
 ## Flags
 
@@ -67,6 +69,9 @@ when exactly one session is live.
 | `--ttl` | `connect` | Idle timeout in minutes, default 30. |
 | `-n, --name` | `connect` | Friendly session name, usable with `-s`. |
 | `--insecure` | `connect` | Do not verify or record host keys. |
+| `--agent / --no-agent` | `connect` | Use ssh-agent keys, on by default. |
+| `--connect-timeout` | `connect` | SSH connect timeout in seconds, default 20. |
+| `--keepalive` | `connect` | SSH keepalive interval in seconds, default 30, 0 disables. |
 | `-s, --session` | most commands | Session id, name, or unique id prefix. |
 | `--timeout` | `exec` | Seconds to wait, default 120. On expiry the command is interrupted and agent-pty exits 124. |
 | `--no-newline` | `send` | Type the text without a trailing newline. |
@@ -75,6 +80,7 @@ when exactly one session is live.
 | `--raw` | `logs` | Keep terminal escape sequences. |
 | `-L, --local` | `forward` | `[BIND:]PORT:HOST:PORT`, listen locally. Repeatable. |
 | `-R, --remote` | `forward` | `[BIND:]PORT:HOST:PORT`, listen on the remote side. Repeatable. |
+| `-D, --dynamic` | `forward` | `[BIND:]PORT`, listen locally as a SOCKS5 proxy. Repeatable. |
 | `--list` | `forward` | Show active forwards. |
 | `--remove ID` | `forward` | Remove a forward by id. |
 | `--json` | `sessions`, `info` | Machine-readable output. |
@@ -87,12 +93,17 @@ when exactly one session is live.
 agent-pty forward -s web -L 8080:localhost:80      # local 8080 -> web's port 80
 agent-pty forward -s web -L 15432:db:5432          # local 15432 -> web -> db:5432
 agent-pty forward -s web -R 9000:localhost:3000    # web's 9000 -> your 3000
+agent-pty forward -s web -D 1080                   # SOCKS5, resolves from the remote side
 agent-pty forward -s web --list
 agent-pty forward -s web --remove 1
 ```
 
-For `-L`, `HOST:PORT` is resolved on the remote side. For `-R`, it is resolved
-on your side. Both default to binding `127.0.0.1`.
+For `-L` and `-D`, `HOST:PORT` is resolved on the remote side. For `-R`, it is
+resolved on your side. All default to binding `127.0.0.1`.
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 http://internal.service/
+```
 
 ## Behavior
 
@@ -118,6 +129,13 @@ on your side. Both default to binding `127.0.0.1`.
   are never written there.
 - The idle TTL closes abandoned sessions and their forwards.
 - Remote `~` is expanded for `upload` and `download` targets.
+- `upload` creates missing remote parent directories and copies directories
+  without needing `upload-dir`. Symlinked directories are skipped to avoid loops.
+- `download` detects a remote directory and copies the tree without needing
+  `download-dir`.
+- `sessions --json` adds live fields: idle, uptime, attached, running and
+  forwards. `logs -f` stops when the session ends.
+- `exec` framing expects a POSIX shell (bash, zsh or sh).
 
 ## Layout
 

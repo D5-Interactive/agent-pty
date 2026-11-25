@@ -100,6 +100,25 @@ def list_sessions(clean: bool = False) -> list[dict]:
     return sorted(sessions, key=lambda s: s.get("started_at", ""))
 
 
+_ARTIFACT_SUFFIXES = {"json", "sock", "log", "out", "cfg", "tmp"}
+
+
+def prune_artifacts() -> int:
+    """Delete files belonging to dead sessions. Returns the count removed."""
+    if not SESSIONS_DIR.is_dir():
+        return 0
+    removed = 0
+    for path in SESSIONS_DIR.iterdir():
+        if not path.is_file() or path.suffix.lstrip(".") not in _ARTIFACT_SUFFIXES:
+            continue
+        state = read_state(path.stem)
+        if state and pid_alive(state.get("pid", 0)):
+            continue
+        path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
 # ── ssh config and exec framing ──────────────────────────────────
 def ssh_config(host: str) -> dict:
     """Resolve HOST through ~/.ssh/config, empty when there is none."""
@@ -168,7 +187,7 @@ _ANSI = re.compile(
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
-_MARK_TEXT = re.compile(r"\\036APTY[0-9a-f]{8}[BZE]\\036|APTY[0-9a-f]{8}[BZE]")
+_MARK_TEXT = re.compile(r"\\036APTY[0-9a-f]{8}(?:B|Z|E[0-9]*)\\036|APTY[0-9a-f]{8}(?:B|Z|E[0-9]*)")
 
 
 def strip_ansi(text: str) -> str:
@@ -189,7 +208,27 @@ def parse_forward(spec: str) -> tuple[str, int, str, int]:
             raise ValueError
     except ValueError as exc:
         raise ValueError(f"bad forward spec: {spec}") from exc
+    if not 0 <= listen_port <= 65535 or not 1 <= target_port <= 65535:
+        raise ValueError(f"bad forward port: {spec}")
     return bind, listen_port, host, target_port
+
+
+def parse_dynamic(spec: str) -> tuple[str, int]:
+    """Parse [bind:]port for a SOCKS5 listener."""
+    parts = spec.split(":")
+    if len(parts) == 1:
+        bind, port = "127.0.0.1", parts[0]
+    elif len(parts) == 2:
+        bind, port = parts[0] or "127.0.0.1", parts[1]
+    else:
+        raise ValueError(f"bad dynamic spec: {spec}")
+    try:
+        listen_port = int(port)
+    except ValueError as exc:
+        raise ValueError(f"bad dynamic spec: {spec}") from exc
+    if not 0 <= listen_port <= 65535:
+        raise ValueError(f"bad dynamic port: {spec}")
+    return bind, listen_port
 
 
 def _pump(left, right) -> None:
@@ -215,6 +254,42 @@ def _pump(left, right) -> None:
                 channel.close()
 
 
+def _read_exact(conn: socket.socket, count: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < count:
+        chunk = conn.recv(count - len(chunks))
+        if not chunk:
+            raise OSError("connection closed")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def socks_handshake(conn: socket.socket) -> tuple[str, int]:
+    """Server side of a SOCKS5 greeting and CONNECT request."""
+    version, count = _read_exact(conn, 2)
+    if version != 5:
+        raise OSError("not socks5")
+    if 0 not in _read_exact(conn, count):
+        conn.sendall(b"\x05\xff")
+        raise OSError("no acceptable auth")
+    conn.sendall(b"\x05\x00")
+    version, command, _reserved, address_type = _read_exact(conn, 4)
+    if version != 5 or command != 1:
+        conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+        raise OSError("only CONNECT is supported")
+    if address_type == 1:
+        host = socket.inet_ntoa(_read_exact(conn, 4))
+    elif address_type == 3:
+        host = _read_exact(conn, _read_exact(conn, 1)[0]).decode("idna")
+    elif address_type == 4:
+        host = socket.inet_ntop(socket.AF_INET6, _read_exact(conn, 16))
+    else:
+        conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+        raise OSError("bad address type")
+    port = int.from_bytes(_read_exact(conn, 2), "big")
+    return host, port
+
+
 # ── file transfer helpers ────────────────────────────────────────
 def remote_path(sftp: paramiko.SFTPClient, path: str) -> str:
     """Expand a leading ~ against the remote home, which sftp does not do."""
@@ -224,7 +299,34 @@ def remote_path(sftp: paramiko.SFTPClient, path: str) -> str:
     return path
 
 
+def _mkdirs(sftp: paramiko.SFTPClient, path: str) -> None:
+    """Create a remote directory and its parents, ignoring existing ones."""
+    path = path.rstrip("/")
+    if not path or path == "/":
+        return
+    try:
+        sftp.stat(path)
+        return
+    except OSError:
+        pass
+    _mkdirs(sftp, posixpath.dirname(path))
+    with contextlib.suppress(OSError):
+        sftp.mkdir(path)
+
+
+def _remote_is_dir(sftp: paramiko.SFTPClient, path: str) -> bool:
+    try:
+        return stat.S_ISDIR(sftp.stat(path).st_mode)
+    except OSError:
+        return False
+
+
 def _put_tree(sftp: paramiko.SFTPClient, local: str, remote: str) -> int:
+    if os.path.islink(local):
+        if os.path.isdir(local):
+            return 0  # skip symlinked directories, which can loop
+        sftp.put(local, remote)
+        return 1
     if os.path.isdir(local):
         with contextlib.suppress(OSError):
             sftp.mkdir(remote)
@@ -237,7 +339,7 @@ def _put_tree(sftp: paramiko.SFTPClient, local: str, remote: str) -> int:
 
 
 def _get_tree(sftp: paramiko.SFTPClient, remote: str, local: str) -> int:
-    if stat.S_ISDIR(sftp.stat(remote).st_mode):
+    if stat.S_ISDIR(sftp.lstat(remote).st_mode):
         os.makedirs(local, exist_ok=True)
         total = 0
         for entry in sftp.listdir_attr(remote):
@@ -261,7 +363,11 @@ class SessionServer:
         self.password: str | None = config.get("password")
         self.key_file: str | None = config.get("key_file")
         self.insecure: bool = bool(config.get("insecure"))
+        self.agent: bool = config.get("agent", True) is not False
+        self.connect_timeout: int = int(config.get("connect_timeout") or 20)
+        self.keepalive: int = int(config.get("keepalive", 30))
         self.ttl_seconds: int = int(config["ttl"]) * 60
+        self.started_at = datetime.now(UTC)
 
         self._cond = threading.Condition()
         self._exec_lock = threading.Lock()
@@ -296,8 +402,8 @@ class SessionServer:
             username=self.user,
             password=self.password,
             key_filename=self.key_file,
-            timeout=20,
-            allow_agent=False,
+            timeout=self.connect_timeout,
+            allow_agent=self.agent,
             look_for_keys=False,
         )
         if not self.insecure:
@@ -308,7 +414,7 @@ class SessionServer:
         transport = self._client.get_transport()
         if transport is None:
             raise RuntimeError("SSH transport unavailable")
-        transport.set_keepalive(30)
+        transport.set_keepalive(self.keepalive)
         cols, rows = _terminal_size()
         channel = transport.open_session()
         channel.get_pty(term=os.environ.get("TERM", "xterm-256color"), width=cols, height=rows)
@@ -558,11 +664,15 @@ class SessionServer:
         if self._client is None or self._stop.is_set():
             return {"ok": False, "error": "session is closed"}
         try:
-            bind, listen_port, host, target_port = parse_forward(spec)
+            if direction == "dynamic":
+                bind, listen_port = parse_dynamic(spec)
+                host, target_port = "socks5", 0
+            else:
+                bind, listen_port, host, target_port = parse_forward(spec)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
-        if direction == "local":
+        if direction in ("local", "dynamic"):
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -572,7 +682,8 @@ class SessionServer:
                 listener.close()
                 return {"ok": False, "error": str(exc)}
             listen_port = listener.getsockname()[1]
-            threading.Thread(target=self._accept_local, args=(listener, host, target_port), daemon=True).start()
+            accepter = self._accept_local if direction == "local" else self._accept_socks
+            threading.Thread(target=accepter, args=(listener, host, target_port), daemon=True).start()
             closer = listener.close
         elif direction == "remote":
             transport = self._client.get_transport()
@@ -622,9 +733,42 @@ class SessionServer:
             return
         try:
             peer = conn.getpeername()
-            channel = transport.open_channel("direct-tcpip", (host, port), peer)
+            channel = transport.open_channel("direct-tcpip", (host, port), peer, timeout=10)
         except (OSError, paramiko.SSHException):
             conn.close()
+            return
+        _pump(conn, channel)
+
+    def _accept_socks(self, listener: socket.socket, _host: str, _port: int) -> None:
+        listener.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._socks_conn, args=(conn,), daemon=True).start()
+
+    def _socks_conn(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(15)
+            host, port = socks_handshake(conn)
+            transport = self._client.get_transport() if self._client else None
+            if transport is None:
+                return
+            try:
+                channel = transport.open_channel("direct-tcpip", (host, port), conn.getpeername(), timeout=10)
+            except (OSError, paramiko.SSHException):
+                conn.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+                conn.close()
+                return
+            conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            conn.settimeout(None)
+            self._touch()
+        except (OSError, paramiko.SSHException, UnicodeError):
+            with contextlib.suppress(OSError):
+                conn.close()
             return
         _pump(conn, channel)
 
@@ -659,11 +803,13 @@ class SessionServer:
             if not os.path.exists(source):
                 return {"ok": False, "error": f"no such path: {local}"}
             target = remote_path(sftp, remote) if remote else posixpath.basename(source.rstrip(os.sep))
-            if directory:
+            if directory or os.path.isdir(source):
+                _mkdirs(sftp, posixpath.dirname(target))
                 files = _put_tree(sftp, source, target)
             else:
-                if target.endswith("/"):
+                if target.endswith("/") or _remote_is_dir(sftp, target):
                     target = posixpath.join(target, posixpath.basename(source))
+                _mkdirs(sftp, posixpath.dirname(target))
                 sftp.put(source, target)
                 files = 1
             audit(self.id, "upload", local=source, remote=target, files=files)
@@ -680,7 +826,7 @@ class SessionServer:
         try:
             remote = remote_path(sftp, remote)
             target = local or posixpath.basename(remote.rstrip("/"))
-            if directory:
+            if directory or _remote_is_dir(sftp, remote):
                 files = _get_tree(sftp, remote, target)
             else:
                 if target.endswith(("/", os.sep)):
@@ -710,6 +856,8 @@ class SessionServer:
             "user": self.user,
             "idle_seconds": idle,
             "ttl": self.ttl_seconds // 60,
+            "started_at": self.started_at.isoformat(timespec="seconds"),
+            "uptime_seconds": int((datetime.now(UTC) - self.started_at).total_seconds()),
             "attached": attached,
             "running": self._exec_lock.locked(),
             "transcript": str(transcript_path(self.id)),

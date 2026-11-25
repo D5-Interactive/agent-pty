@@ -1,10 +1,24 @@
-"""Offline checks for the CLI surface and PTY exec framing."""
+"""Offline checks for the CLI surface, exec framing, transfers and forwards."""
+
+import json
+import os
+import sys
 
 import pytest
 from click.testing import CliRunner
 
-from agent_pty.main import _session_id, cli
-from agent_pty.session import clean_output, parse_exec, parse_forward, parse_partial, pty_payload, strip_ansi
+from agent_pty import session as session_module
+from agent_pty.main import _resolve, _session_id, cli
+from agent_pty.session import (
+    clean_output,
+    parse_dynamic,
+    parse_exec,
+    parse_forward,
+    parse_partial,
+    prune_artifacts,
+    pty_payload,
+    strip_ansi,
+)
 
 COMMANDS = [
     "connect",
@@ -16,6 +30,7 @@ COMMANDS = [
     "interrupt",
     "rename",
     "forward",
+    "prune",
     "upload",
     "upload-dir",
     "download",
@@ -43,7 +58,7 @@ def test_help_lists_every_command():
         ("send", ["--session", "--no-newline", "TEXT"]),
         ("interrupt", ["--session"]),
         ("rename", ["--session", "NEW_NAME"]),
-        ("forward", ["--session", "--local", "--remote", "--list", "--remove"]),
+        ("forward", ["--session", "--local", "--remote", "--dynamic", "--list", "--remove"]),
         ("upload", ["--session", "LOCAL", "REMOTE"]),
         ("upload-dir", ["--session", "LOCAL", "REMOTE"]),
         ("download", ["--session", "REMOTE", "LOCAL"]),
@@ -112,6 +127,10 @@ def test_strip_ansi_removes_escapes_and_control_bytes():
     assert strip_ansi(raw) == "helloworld"
 
 
+def test_strip_ansi_removes_exec_markers():
+    assert strip_ansi("a\x1eAPTYdeadbeefB\x1eb\x1eAPTYdeadbeefE0\x1ec") == "abc"
+
+
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
@@ -126,8 +145,51 @@ def test_parse_forward(spec, expected):
 
 @pytest.mark.parametrize("spec", ["8080", "a:b:c:d:e", "x:y:z"])
 def test_parse_forward_rejects_bad_specs(spec):
-    with pytest.raises(ValueError, match="bad forward spec"):
+    with pytest.raises(ValueError):
         parse_forward(spec)
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("1080", ("127.0.0.1", 1080)),
+        ("10.0.0.5:1080", ("10.0.0.5", 1080)),
+        ("1080", ("127.0.0.1", 1080)),
+    ],
+)
+def test_parse_dynamic(spec, expected):
+    assert parse_dynamic(spec) == expected
+
+
+@pytest.mark.parametrize("spec", ["1:2:3:4:5", "x:y:z:w", "1080:host:99999"])
+def test_parse_forward_rejects_bad_ports(spec):
+    with pytest.raises(ValueError):
+        parse_forward(spec)
+
+
+def test_resolve_refuses_duplicate_names(monkeypatch):
+    live = [
+        {"id": "a-111111", "name": "web", "socket": "a.sock"},
+        {"id": "b-222222", "name": "web", "socket": "b.sock"},
+    ]
+    monkeypatch.setattr(sys.modules["agent_pty.main"], "list_sessions", lambda clean=False: live)
+    with pytest.raises(Exception, match="several sessions are named"):
+        _resolve("web")
+    assert _resolve("a-111111")["id"] == "a-111111"
+
+
+def test_prune_keeps_live_sessions_and_drops_dead_ones(monkeypatch, tmp_path):
+    monkeypatch.setattr(session_module, "SESSIONS_DIR", tmp_path)
+    for session_id, pid in (("live-1", os.getpid()), ("dead-1", 999999)):
+        (tmp_path / f"{session_id}.json").write_text(json.dumps({"id": session_id, "pid": pid}))
+        for suffix in ("sock", "out", "log"):
+            (tmp_path / f"{session_id}.{suffix}").write_text("x")
+    removed = prune_artifacts()
+    assert not (tmp_path / "dead-1.json").exists()
+    assert not (tmp_path / "dead-1.out").exists()
+    assert (tmp_path / "live-1.json").exists()
+    assert (tmp_path / "live-1.out").exists()
+    assert removed == 4
 
 
 def test_session_id_is_socket_safe():

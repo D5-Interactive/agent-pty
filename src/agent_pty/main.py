@@ -23,6 +23,8 @@ from .session import (
     ensure_dirs,
     list_sessions,
     log_path,
+    pid_alive,
+    prune_artifacts,
     sock_path,
     state_path,
     strip_ansi,
@@ -65,6 +67,8 @@ def _resolve(name: str | None) -> dict:
             raise click.ClickException(f"several sessions live ({names}); pick one with -s")
         return sessions[0]
     exact = [s for s in sessions if name in (s["id"], s.get("name"))]
+    if len(exact) > 1:
+        raise click.ClickException(f"several sessions are named {name!r}; use a full id")
     if exact:
         return exact[0]
     partial = [s for s in sessions if s["id"].startswith(name)]
@@ -94,7 +98,7 @@ def _tail(path: Path, lines: int, raw: bool = False) -> str:
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
         data = b""
-        while size > 0 and data.count(b"\n") <= lines:
+        while size > 0 and data.count(b"\n") <= lines and len(data) < 262_144:
             step = min(8192, size)
             size -= step
             fh.seek(size)
@@ -130,6 +134,11 @@ def cli() -> None:
 @click.option("--ttl", default=30, show_default=True, type=int, help="Idle timeout in minutes.")
 @click.option("-n", "--name", default=None, help="Friendly session name.")
 @click.option("--insecure", is_flag=True, help="Do not verify or record host keys.")
+@click.option("--agent/--no-agent", default=True, show_default=True, help="Use ssh-agent keys.")
+@click.option("--connect-timeout", default=20, show_default=True, type=int, help="SSH connect timeout in seconds.")
+@click.option(
+    "--keepalive", default=30, show_default=True, type=int, help="SSH keepalive interval in seconds, 0 to disable."
+)
 def connect(
     host: str,
     port: int,
@@ -139,6 +148,9 @@ def connect(
     ttl: int,
     name: str | None,
     insecure: bool,
+    agent: bool,
+    connect_timeout: int,
+    keepalive: int,
 ) -> None:
     """Open a background session with an interactive PTY on HOST.
 
@@ -161,6 +173,9 @@ def connect(
         "password": password,
         "key_file": str(Path(key_file).expanduser()) if key_file else None,
         "insecure": insecure,
+        "agent": agent,
+        "connect_timeout": connect_timeout,
+        "keepalive": keepalive,
         "ttl": ttl,
     }
     config_path = SESSIONS_DIR / f"{session_id}.cfg"
@@ -168,6 +183,7 @@ def connect(
     os.chmod(config_path, 0o600)
 
     with log_path(session_id).open("ab") as log:
+        os.chmod(log_path(session_id), 0o600)
         proc = subprocess.Popen(  # noqa: S603
             [sys.executable, "-m", "agent_pty.session", str(config_path)],
             stdin=subprocess.DEVNULL,
@@ -202,15 +218,24 @@ def connect(
 def sessions_cmd(as_json: bool) -> None:
     """List live background sessions."""
     found = list_sessions(clean=True)
+    probes = {state["id"]: _rpc(Path(state["socket"]), "info", 0.5) for state in found}
     if as_json:
-        click.echo(json.dumps(found, indent=2))
+        entries = []
+        for state in found:
+            probe = probes[state["id"]]
+            entry = dict(state)
+            entry["live"] = probe.get("ok", False)
+            for key in ("idle_seconds", "uptime_seconds", "attached", "running", "forwards"):
+                entry[key] = probe.get(key)
+            entries.append(entry)
+        click.echo(json.dumps(entries, indent=2))
         return
     if not found:
         click.echo("no live sessions")
         return
     rows = [("ID", "NAME", "TARGET", "PID", "IDLE", "STARTED", "TTL")]
     for state in found:
-        probe = _rpc(Path(state["socket"]), "info", 1)
+        probe = probes[state["id"]]
         idle = f"{probe['idle_seconds']}s" if probe.get("ok") else "-"
         rows.append(
             (
@@ -332,6 +357,9 @@ def logs_cmd(name: str | None, lines: int, follow: bool, raw: bool) -> None:
                 text = clean_output(chunk.decode("utf-8", errors="replace"))
                 click.echo(text if raw else strip_ansi(text), nl=False)
                 position += len(chunk)
+            if not pid_alive(state["pid"]):
+                click.echo("\n[session closed]")
+                return
             time.sleep(0.25)
     except KeyboardInterrupt:
         return
@@ -405,7 +433,21 @@ def info_cmd(name: str | None, as_json: bool) -> None:
     if as_json:
         click.echo(json.dumps(result, indent=2))
         return
-    for key in ("id", "name", "host", "port", "user", "idle_seconds", "ttl", "attached", "running", "transcript"):
+    keys = (
+        "id",
+        "name",
+        "host",
+        "port",
+        "user",
+        "idle_seconds",
+        "uptime_seconds",
+        "started_at",
+        "ttl",
+        "attached",
+        "running",
+        "transcript",
+    )
+    for key in keys:
         click.echo(f"{key}: {result.get(key)}")
     for entry in result.get("forwards") or []:
         click.echo(f"forward {entry['id']}: -{entry['direction'][0].upper()} {entry['listen']} -> {entry['target']}")
@@ -459,12 +501,21 @@ def rename_cmd(name: str | None, new_name: str) -> None:
     metavar="[BIND:]PORT:HOST:PORT",
     help="Listen on the remote side and forward to the local side.",
 )
+@click.option(
+    "-D",
+    "--dynamic",
+    "dynamic_forwards",
+    multiple=True,
+    metavar="[BIND:]PORT",
+    help="Listen locally as a SOCKS5 proxy.",
+)
 @click.option("--list", "list_forwards", is_flag=True, help="Show active forwards.")
 @click.option("--remove", "remove_id", default=None, type=int, help="Remove a forward by id.")
 def forward_cmd(
     name: str | None,
     local_forwards: tuple[str, ...],
     remote_forwards: tuple[str, ...],
+    dynamic_forwards: tuple[str, ...],
     list_forwards: bool,
     remove_id: int | None,
 ) -> None:
@@ -481,12 +532,19 @@ def forward_cmd(
         _rpc_or_fail(state, "unforward", 10, id=remove_id)
         click.echo(f"removed forward {remove_id}")
         return
-    for direction, specs in (("local", local_forwards), ("remote", remote_forwards)):
+    groups = (("local", local_forwards), ("remote", remote_forwards), ("dynamic", dynamic_forwards))
+    for direction, specs in groups:
         for spec in specs:
             result = _rpc_or_fail(state, "forward", 20, direction=direction, spec=spec)
             click.echo(f"{result['id']}\t-{direction[0].upper()}\t{result['listen']}\t{result['target']}")
-    if not local_forwards and not remote_forwards:
-        raise click.ClickException("pass -L, -R, --list, or --remove")
+    if not any(specs for _, specs in groups):
+        raise click.ClickException("pass -L, -R, -D, --list, or --remove")
+
+
+@cli.command("prune")
+def prune_cmd() -> None:
+    """Delete session files left behind by closed or crashed sessions."""
+    click.echo(f"removed {prune_artifacts()} file(s)")
 
 
 def main() -> None:
